@@ -1,0 +1,934 @@
+# external_validation_config.yaml
+# -----------------------------------------------------------------------------
+# External validation configuration for the frozen LSA-ConvTok Hybrid model.
+#
+# Purpose:
+#   This file defines the fixed, pre-specified configuration for evaluating the
+#   final SimpleViT_LSA_ConvTok model on the independent new-microscope external
+#   validation dataset. It is intended to be consumed by:
+#
+#     - external_manifest.py
+#     - audit_external_tiffs.py
+#     - preprocess_external.py
+#     - load_frozen_hybrid.py
+#     - evaluate_external_generalization.py
+#     - external_statistics.py
+#     - external_plotting.py  # optional; figures only, not required for core validation
+#
+# Scientific principle:
+#   The external dataset is an acquisition-domain validation set, not an
+#   extension of the original training data. No model training, fine-tuning,
+#   threshold tuning, or model selection should be performed using these data.
+# -----------------------------------------------------------------------------
+
+schema_version: "1.1"
+project:
+  name: "External Validation of the LSA-ConvTok Hybrid Model Under Microscope-Domain Shift"
+  author: "Rodrigo Sá"
+  year: 2026
+  dataset_role: "external_validation"
+  domain_name: "external_new_microscope"
+  primary_scientific_question: >
+    Does the frozen Hybrid SimpleViT_LSA_ConvTok model, trained entirely on
+    the original 12-bit microscope domain, maintain slide-level diagnostic
+    performance on an independent 14-bit microscope domain without retraining,
+    fine-tuning, threshold tuning, or model selection?
+
+# -----------------------------------------------------------------------------
+# Input data and metadata files
+# -----------------------------------------------------------------------------
+inputs:
+  raw_dataset:
+    # Can be a ZIP archive or extracted dataset directory.
+    # Expected internal structure:
+    #   fungi/
+    #     Candida albicans/
+    #     Candida glabrata/
+    path: "data/fungi.zip"
+    expected_format: "TIFF"
+    expected_extensions: [".tif", ".tiff", ".TIF", ".TIFF"]
+
+  external_metadata_json:
+    # Stores slide-level species annotations, C. albicans hyphae status,
+    # acquisition metadata, training-domain reference metadata, and validation
+    # rules. This replaces hard-coded slide annotations inside scripts.
+    path: "configs/external_validation_metadata.json"
+
+# -----------------------------------------------------------------------------
+# Checkpoint artifacts
+# -----------------------------------------------------------------------------
+checkpoints:
+  primary_inference_checkpoint:
+    path: "final_model_lsa_convtok.pth"
+    role: "primary_frozen_inference_artifact"
+    description: >
+      Clean exported checkpoint used for external validation inference and
+      explainability. It should contain the frozen model_state_dict, embedded
+      model configuration, architecture metadata, checkpoint mean/std, and
+      training metadata.
+
+  provenance_checkpoint:
+    path: "final_model_checkpoint.pth"
+    role: "training_resume_provenance_artifact"
+    required: false
+    description: >
+      Full final training-resume checkpoint. It may contain optimizer,
+      scheduler, scaler, RNG, and training-resume state. It should not be the
+      default inference artifact, but can be used to verify model_state_dict
+      equivalence with the exported inference checkpoint.
+
+  expected_model:
+    model_variant: "SimpleViT_LSA_ConvTok"
+    experiment_name: "lsa_convtok"
+    architecture_hash: "95ace50634b621d7"
+    image_size: 384
+    channels: 1
+    num_classes: 2
+    checkpoint_training_bit_depth: 12
+    checkpoint_mean: [0.23691008985042572]
+    checkpoint_std: [0.007409718818962574]
+
+  validation_policy:
+    validate_architecture_hash: true
+    abort_on_architecture_mismatch: true
+    validate_state_dict_keys: true
+    compare_primary_and_provenance_weights_if_available: true
+    set_eval_mode: true
+    disable_gradients: true
+
+# -----------------------------------------------------------------------------
+# Class labels and biological annotation policy
+# -----------------------------------------------------------------------------
+labels:
+  class_names:
+    - "Candida albicans"
+    - "Candida glabrata"
+  class_to_index:
+    "Candida albicans": 0
+    "Candida glabrata": 1
+  index_to_class:
+    0: "Candida albicans"
+    1: "Candida glabrata"
+
+  slide_id_parsing:
+    filename_pattern_description: >
+      Each image filename is expected to contain acquisition date, species
+      acronym, slide letter, and image index, for example:
+      20250813_alb_A_1.tif.
+    expected_parts:
+      - "acquisition_date"
+      - "species_code"
+      - "slide_letter"
+      - "image_index"
+    slide_id_format: "{acquisition_date}_{species_code}_{slide_letter}"
+    species_codes:
+      alb: "Candida albicans"
+      gla: "Candida glabrata"
+
+  morphology_subgroups:
+    albicans_hyphae_status_values:
+      - "hyphae"
+      - "no_hyphae"
+    glabrata_hyphae_status: "not_applicable"
+    use_hyphae_as_class_label: false
+    purpose: >
+      Hyphae status is used only for subgroup/error-regime analysis in
+      C. albicans. It must not be treated as a third model class because the
+      trained model is a binary species classifier.
+
+# -----------------------------------------------------------------------------
+# Expected external-validation cohort structure
+# -----------------------------------------------------------------------------
+expected_external_cohort:
+  total_slides: 24
+  slides_per_species:
+    "Candida albicans": 12
+    "Candida glabrata": 12
+  albicans_morphology_counts:
+    hyphae: 5
+    no_hyphae: 7
+  expected_images_per_slide:
+    approximate_mean: 62
+    acceptable_minimum_for_audit_warning: 20
+    acceptable_maximum_for_audit_warning: 100
+  split_policy:
+    create_train_test_split: false
+    rationale: >
+      All 24 slides belong to the external validation cohort. The external
+      dataset must not be split for training, model selection, threshold tuning,
+      or preprocessing selection.
+
+# -----------------------------------------------------------------------------
+# Acquisition-domain metadata
+# -----------------------------------------------------------------------------
+training_domain_reference:
+  microscope: "Zeiss Axio Observer"
+  camera: "Prime 95B, monochrome"
+  objective: "Plan-Apochromat 63x/1.4 Oil"
+  illumination: "Brightfield, TL LED, 10%"
+  software: "ZEN Blue"
+  exposure_time_ms: 10
+  bit_depth: 12
+  pixel_spacing_um:
+    x: 0.175
+    y: 0.175
+  raw_image_size_px:
+    height: 1200
+    width: 1200
+  physical_field_of_view_um:
+    height: 210.0
+    width: 210.0
+  sampling_strategy: >
+    Random image fields per slide; approximately 62 images per slide; focus
+    manually optimized per slide and then kept constant.
+  calibration: "No calibration performed"
+
+external_domain:
+  microscope: "Zeiss Axio Observer.Z1"
+  camera: "Axiocam 820, monochrome"
+  objective: "Plan-Apochromat 63x/1.4 Oil"
+  illumination: "Brightfield, TL LED, 20%"
+  software: "ZEN Blue"
+  exposure_time_ms: 50
+  bit_depth_reported_by_lab: 14
+  pixel_spacing_um:
+    x: 0.043
+    y: 0.043
+  raw_image_size_px:
+    height: 2256
+    width: 2256
+  physical_field_of_view_um:
+    height: 97.008
+    width: 97.008
+  sample_preparation: "Agar pad technique using 1.7% agarose and 5 µL culture"
+  sampling_strategy: >
+    Images acquired from random areas of each slide; approximately 62 images
+    per slide; focus manually optimized per slide and then kept constant.
+  calibration: "No calibration performed"
+
+domain_shift:
+  treat_as_external_domain_shift: true
+  shift_factors:
+    - "camera_sensor"
+    - "bit_depth_photometric_scale"
+    - "illumination_exposure"
+    - "pixel_spacing_geometric_scale"
+    - "possible_morphology_distribution_shift"
+  training_to_external_bit_depth:
+    training_bit_depth: 12
+    external_reported_bit_depth: 14
+    rule: >
+      The checkpoint training bit depth documents the original domain only. It
+      must not force 12-bit normalization of external TIFFs. External raw TIFFs
+      should be normalized according to their inferred effective bit depth,
+      expected to be 14-bit.
+  pixel_spacing:
+    training_um_per_px: 0.175
+    external_um_per_px: 0.043
+    external_to_training_linear_sampling_density_ratio: 4.069767
+    external_content_resampling_factor_to_training_spacing: 0.245714
+    training_raw_image_size_px: [1200, 1200]
+    external_raw_image_size_px: [2256, 2256]
+    training_physical_fov_um: [210.0, 210.0]
+    external_physical_fov_um: [97.008, 97.008]
+    fov_interpretation: >
+      The external image has approximately 4.07 times finer linear sampling,
+      but a smaller physical field of view than the training images. Therefore,
+      scale-matching should resample external content by 0.043/0.175 and embed
+      the result into the 1200 x 1200 training raw canvas before final resizing.
+    interpretation: >
+      The external images have approximately 4.07 times smaller pixel spacing
+      per linear dimension than the training-domain images. This may cause the
+      same fungal cells to occupy more pixels before resizing, creating a
+      geometric scale shift.
+
+# -----------------------------------------------------------------------------
+# TIFF audit policy
+# -----------------------------------------------------------------------------
+tiff_audit:
+  required_before_preprocessing: true
+  expected_single_channel: true
+  expected_external_effective_bit_depth: 14
+  expected_container_bit_depths: [14, 16]
+  supported_bit_depths: [8, 12, 14, 16]
+
+  required_per_image_fields:
+    - "image_path"
+    - "slide_id"
+    - "species_name"
+    - "hyphae_status"
+    - "shape"
+    - "dtype"
+    - "container_bit_depth"
+    - "min_pixel"
+    - "max_pixel"
+    - "mean_pixel"
+    - "std_pixel"
+    - "p001"
+    - "p01"
+    - "p1"
+    - "p50"
+    - "p99"
+    - "p999"
+    - "zero_fraction"
+    - "values_above_4095_fraction"
+    - "values_above_16383_fraction"
+    - "saturation_fraction_14bit"
+    - "saturation_fraction_16bit"
+    - "inferred_effective_bit_depth"
+    - "is_single_channel"
+    - "audit_status"
+
+  abort_conditions:
+    non_tiff_file_detected: true
+    unreadable_or_corrupt_file: true
+    non_single_channel_image: true
+    missing_slide_id_in_metadata: true
+    mixed_species_labels_within_slide: true
+    severe_unexplained_bit_depth_mismatch: true
+
+  warning_conditions:
+    any_values_above_4095: >
+      Expected for true 14-bit images and confirms that 12-bit normalization
+      would be inappropriate.
+    values_above_16383: >
+      May indicate unexpected scaling, export processing, or full 16-bit data.
+      Must be investigated before final analysis.
+    high_saturation_fraction_14bit: >
+      May indicate clipping or exposure issues in the external acquisition.
+    images_per_slide_outside_expected_range: true
+
+# -----------------------------------------------------------------------------
+# Physical scale-matching sensitivity-analysis geometry
+# -----------------------------------------------------------------------------
+scale_matching_sensitivity:
+  scientific_role: "post_hoc_sensitivity_not_primary"
+  rationale: >
+    Tests whether the external-domain failure may be partly explained by the
+    0.043 µm/px external pixel spacing versus the 0.175 µm/px training pixel
+    spacing. This analysis must remain separate from the locked primary external
+    validation and must not be used for model selection.
+  training_pixel_spacing_um: 0.175
+  external_pixel_spacing_um: 0.043
+  content_resampling_factor_external_to_training: 0.245714
+  training_over_external_linear_sampling_density_ratio: 4.069767
+  training_raw_image_size_px:
+    height: 1200
+    width: 1200
+  external_raw_image_size_px:
+    height: 2256
+    width: 2256
+  training_physical_fov_um:
+    height: 210.0
+    width: 210.0
+  external_physical_fov_um:
+    height: 97.008
+    width: 97.008
+  expected_resampled_external_content_px_at_training_spacing:
+    height: 554
+    width: 554
+  expected_content_fraction_in_training_canvas: 0.213136
+  expected_padding_fraction_in_training_canvas: 0.786864
+  expected_effective_content_size_in_384_px:
+    height: 177
+    width: 177
+  target_canvas_policy: "embed_resampled_external_content_in_training_raw_canvas"
+  target_canvas_height_px: 1200
+  target_canvas_width_px: 1200
+  padding_policy: "median"
+  interpretation_guardrail: >
+    The scale-matched result is a post hoc diagnostic analysis. Because the
+    external physical field of view is smaller than the training field of view,
+    even the training-canvas implementation contains substantial padding and
+    must not be reported as corrected deployment performance.
+
+# -----------------------------------------------------------------------------
+# Photometric sensitivity-analysis policy
+# -----------------------------------------------------------------------------
+photometric_sensitivity:
+  scientific_role: "post_hoc_photometric_mean_std_sensitivity_not_primary"
+  enabled_for_final_diagnostic_run: true
+  mode_name: "photometric_mean_std_matched_pipeline"
+  rationale: >
+    The primary locked external validation showed that the new-microscope images
+    are strongly shifted relative to the frozen training-domain normalization
+    statistics. This single predefined diagnostic analysis tests whether global
+    photometric mismatch plausibly contributes to the external-domain failure.
+    It must not replace the primary locked external-validation result and must
+    not be used for model selection, threshold tuning, or preprocessing selection
+    based on best external performance.
+  harmonization_method: "per_image_linear_mean_std_matching_to_frozen_checkpoint_statistics"
+  transformation: >
+    For each resized external image x in [0, 1], compute its image-level mean
+    and standard deviation, transform it as y = ((x - mean(x)) / std(x)) *
+    checkpoint_std + checkpoint_mean, then clip y to [0, 1]. The downstream
+    PyTorch Dataset still applies the frozen checkpoint mean/std before model
+    inference.
+  checkpoint_statistics_source:
+    mean_source: "primary_inference_checkpoint.mean"
+    std_source: "primary_inference_checkpoint.std"
+    expected_mean: [0.23691008985042572]
+    expected_std: [0.007409718818962574]
+  external_information_used:
+    labels_used: false
+    predictions_used: false
+    performance_used_to_define_transform: false
+    per_image_unlabeled_intensity_statistics_used: true
+  numerical_safety:
+    min_source_std: 0.000001
+    post_harmonization_clip_to_unit_interval: true
+  interpretation_guardrail: >
+    This is a diagnostic sensitivity analysis. Improvement suggests that global
+    photometric mismatch contributed to the external failure, but it does not
+    constitute unbiased primary external-validation performance because the
+    external input distribution was modified after observing domain shift. Lack
+    of improvement suggests that global photometric mismatch alone is
+    insufficient to explain the failure.
+  report_as_primary_external_validation: false
+
+# -----------------------------------------------------------------------------
+# Preprocessing policy
+# -----------------------------------------------------------------------------
+preprocessing:
+  primary_mode: "locked_pixel_pipeline"
+  sensitivity_modes:
+    - "scale_matched_physical_pipeline"
+    - "photometric_mean_std_matched_pipeline"
+  post_resize_clipping:
+    enabled_by_default: true
+    scientific_role: "physical_range_enforcement_after_interpolation"
+    rule: "clip all non-standardized float32 arrays to [0.0, 1.0] after interpolation and before checkpoint standardization"
+    rationale: >
+      Raw-bit-depth-normalized microscopy intensities are physically bounded in
+      [0, 1]. Lanczos and related interpolation kernels can overshoot slightly
+      outside this range after resizing or scale-matching. Post-resize clipping
+      removes these non-physical interpolation artifacts without using labels,
+      predictions, or external performance.
+    applies_to_modes:
+      - "locked_pixel_pipeline"
+      - "scale_matched_physical_pipeline"
+      - "photometric_mean_std_matched_pipeline"
+    disable_only_for_replication_of_older_unclipped_runs: true
+
+  available_modes:
+    locked_pixel_pipeline:
+      primary_or_sensitivity: "primary"
+      description: >
+        Primary external-validation preprocessing. Raw external TIFFs are
+        normalized using inferred external bit depth, expected 14-bit, resized
+        to the model input size, and later standardized using checkpoint mean/std.
+      raw_bit_depth_policy: "infer_from_tiff_audit_expected_14bit"
+      normalization_denominator_policy: "2^inferred_effective_bit_depth - 1"
+      expected_normalization_denominator: 16383
+      resize_policy: "resize_to_model_image_size"
+      output_dtype: "float32"
+      output_range_before_checkpoint_standardization: [0.0, 1.0]
+      apply_basicpy: false
+      apply_training_checkpoint_mean_std_in_dataset: true
+      spatial_policy: "pixel_locked_resize_to_384"
+      image_size: 384
+
+    scale_matched_physical_pipeline:
+      primary_or_sensitivity: "post_hoc_sensitivity"
+      description: >
+        Post hoc diagnostic preprocessing used only after the locked primary
+        analysis. It tests whether the external-domain failure may be partly
+        explained by the physical pixel-spacing mismatch. External image content
+        is resampled by external_um_per_px / training_um_per_px, embedded into
+        the 1200 x 1200 training raw canvas, then resized to the frozen model
+        input size. This mode must not be used for model selection and must not
+        replace the primary locked_pixel_pipeline result.
+      raw_bit_depth_policy: "infer_from_tiff_audit_expected_14bit"
+      normalization_denominator_policy: "2^inferred_effective_bit_depth - 1"
+      expected_normalization_denominator: 16383
+      physical_scale_policy: "resample_content_to_training_pixel_spacing_before_final_model_resize"
+      training_pixel_spacing_um: 0.175
+      external_pixel_spacing_um: 0.043
+      content_scale_external_to_training: 0.245714
+      training_over_external_linear_sampling_density_ratio: 4.069767
+      approximate_area_sampling_density_ratio: 16.562
+      canvas_restore_policy: "center_pad_or_crop_to_training_raw_canvas"
+      target_canvas_height_px: 1200
+      target_canvas_width_px: 1200
+      training_raw_image_size_px: [1200, 1200]
+      external_raw_image_size_px: [2256, 2256]
+      expected_resampled_external_content_px_at_training_spacing: [554, 554]
+      expected_content_fraction_in_training_canvas: 0.213136
+      expected_padding_fraction_in_training_canvas: 0.786864
+      expected_effective_content_size_in_384_px: [177, 177]
+      default_padding_policy: "median"
+      final_resize_policy: "resize_to_model_image_size"
+      output_dtype: "float32"
+      output_range_before_checkpoint_standardization: [0.0, 1.0]
+      apply_basicpy: false
+      apply_training_checkpoint_mean_std_in_dataset: true
+      spatial_policy: "scale_matched_sensitivity_then_resize_to_384"
+      image_size: 384
+      interpretation_rules:
+        if_performance_improves: >
+          Improvement suggests that geometric scale mismatch contributed to the
+          external-domain failure, especially given the Hybrid model's
+          convolutional tokenization/locality mechanisms. It does not prove that
+          scale was the only cause because padding, interpolation, illumination,
+          camera response, and biological/preparative differences remain
+          confounded.
+        if_performance_does_not_improve: >
+          Lack of recovery suggests that physical pixel spacing alone does not
+          explain the external-domain failure. Camera/sensor response,
+          illumination/exposure, contrast/noise distribution, sample preparation,
+          morphology distribution, or other domain-shift factors likely
+          contributed.
+
+    photometric_mean_std_matched_pipeline:
+      primary_or_sensitivity: "post_hoc_sensitivity"
+      description: >
+        Post hoc diagnostic preprocessing used only to test whether global
+        photometric mismatch contributed to the external-domain failure. Raw
+        external TIFFs are normalized as 14-bit data, resized to the frozen
+        model input size, clipped to [0, 1], linearly matched per image to the
+        frozen checkpoint training mean/std, clipped again to [0, 1], and later
+        standardized in the Dataset using the same checkpoint mean/std. This
+        mode must not replace the locked_pixel_pipeline primary result.
+      raw_bit_depth_policy: "infer_from_tiff_audit_expected_14bit"
+      normalization_denominator_policy: "2^inferred_effective_bit_depth - 1"
+      expected_normalization_denominator: 16383
+      photometric_policy: "per_image_mean_std_match_to_frozen_checkpoint_statistics"
+      checkpoint_mean: [0.23691008985042572]
+      checkpoint_std: [0.007409718818962574]
+      source_statistics_unit: "image"
+      uses_external_labels: false
+      uses_external_predictions: false
+      uses_external_performance_for_selection: false
+      min_source_std: 0.000001
+      post_resize_clip_to_unit_interval: true
+      post_harmonization_clip_to_unit_interval: true
+      final_resize_policy: "resize_to_model_image_size"
+      output_dtype: "float32"
+      output_range_before_checkpoint_standardization: [0.0, 1.0]
+      apply_basicpy: false
+      apply_training_checkpoint_mean_std_in_dataset: true
+      spatial_policy: "pixel_locked_resize_with_post_hoc_photometric_mean_std_matching"
+      image_size: 384
+      interpretation_rules:
+        if_performance_improves: >
+          Improvement suggests that global photometric mismatch was an important
+          contributor to external-domain failure. Because the harmonization uses
+          external input intensity statistics and was performed after observing
+          domain shift, it must be reported only as diagnostic sensitivity
+          evidence rather than primary external-validation performance.
+        if_performance_does_not_improve: >
+          Lack of recovery suggests that global photometric mean/std mismatch
+          alone does not explain the failure. Remaining acquisition differences,
+          including field of view, scale, camera response, focus, texture,
+          morphology distribution, or sample preparation, likely contributed.
+
+  checkpoint_standardization:
+    use_checkpoint_mean_std: true
+    mean_source: "primary_inference_checkpoint"
+    std_source: "primary_inference_checkpoint"
+    apply_after_raw_linear_normalization_and_resize: true
+    do_not_recompute_mean_std_on_external_set_for_primary: true
+
+# -----------------------------------------------------------------------------
+# Inference and evaluation policy
+# -----------------------------------------------------------------------------
+inference:
+  batch_size: 64
+  num_workers: 2
+  use_amp: true
+  no_grad: true
+  shuffle: false
+  deterministic_order: true
+
+evaluation:
+  primary_unit: "slide"
+  secondary_unit: "image"
+  slide_aggregation:
+    primary_rule: "mean_probability"
+    formula: "p_slide,c = mean_i(p_image_i,c); y_slide = argmax_c(p_slide,c)"
+    tune_aggregation_rule_on_external_data: false
+
+  threshold_policy:
+    tune_threshold_on_external_data: false
+    binary_decision_rule: "argmax_mean_slide_probability"
+    fixed_probability_threshold_for_descriptive_binary_plots: 0.5
+
+  primary_slide_level_metrics:
+    - "balanced_accuracy"
+    - "accuracy"
+    - "matthews_corrcoef"
+    - "weighted_f1"
+    - "auroc"
+    - "sensitivity_per_class"
+    - "specificity_per_class"
+    - "confusion_matrix"
+
+  secondary_image_level_metrics:
+    - "accuracy"
+    - "balanced_accuracy"
+    - "matthews_corrcoef"
+    - "weighted_f1"
+    - "auroc"
+    - "confusion_matrix"
+
+  subgroup_analysis:
+    enabled: true
+    subgroups:
+      - "Candida albicans with hyphae"
+      - "Candida albicans without hyphae"
+      - "Candida glabrata"
+    report_fields:
+      - "n_slides"
+      - "n_images"
+      - "slide_accuracy"
+      - "image_accuracy_descriptive_only"
+      - "mean_true_class_probability"
+      - "mean_confidence"
+      - "n_misclassified_slides"
+      - "misclassified_slide_ids"
+
+  bootstrap_confidence_intervals:
+    enabled: true
+    resampling_unit: "slide"
+    n_bootstrap: 10000
+    confidence_level: 0.95
+    seed: 42
+    stratify_by_class_if_possible: true
+    do_not_bootstrap_images_independently: true
+
+  calibration:
+    enabled: true
+    primary_interpretation: "descriptive"
+    do_not_fit_calibration_on_external_labels_for_primary: true
+    metrics:
+      - "brier_score"
+      - "expected_calibration_error"
+      - "confidence_correct_vs_incorrect"
+
+  domain_shift_statistics:
+    enabled: true
+    compare_external_against_original_if_available: true
+    intensity_statistics:
+      - "mean"
+      - "std"
+      - "percentiles"
+      - "ks_statistic"
+      - "wasserstein_distance"
+    embedding_statistics_optional:
+      - "domain_classifier_auroc"
+      - "maximum_mean_discrepancy"
+      - "class_conditional_centroid_distance"
+      - "silhouette_score_by_domain"
+    caution: >
+      Do not use arbitrary hard thresholds such as KS > 0.15 as proof of
+      domain shift. Compare external shift against internal train-test shift
+      when possible.
+
+# -----------------------------------------------------------------------------
+# Plotting and explainability policy
+# -----------------------------------------------------------------------------
+plotting:
+  generate_figures: false
+  optional: true
+  required_for_core_validation: false
+  figures:
+    - "raw_external_intensity_histograms"
+    - "original_vs_external_intensity_histograms_if_available"
+    - "slide_level_confusion_matrix"
+    - "per_slide_predicted_probability_dot_plot"
+    - "per_slide_confidence_plot"
+    - "confidence_by_subgroup"
+    - "probability_distributions_by_slide"
+    - "error_examples_by_slide"
+    - "optional_embedding_tsne_or_umap"
+
+  embedding_visualization:
+    enabled: false
+    methods: ["t-SNE", "UMAP"]
+    interpretation: >
+      Embedding visualizations are exploratory only. They may suggest apparent
+      feature-space separation between acquisition domains but must not be
+      interpreted as formal proof that the classifier relies on microscope-
+      specific features.
+
+explainability:
+  enabled: true
+  primary_method_for_hybrid_model: "attention_rollout_or_attention_based_review"
+  purpose: "error_analysis_and_qualitative_review"
+  use_for_causal_biological_claims: false
+  recommended_groups:
+    - "high_confidence_correct_albicans"
+    - "high_confidence_correct_glabrata"
+    - "low_confidence_correct_cases"
+    - "misclassified_albicans"
+    - "misclassified_glabrata"
+    - "albicans_with_hyphae"
+    - "albicans_without_hyphae"
+
+# -----------------------------------------------------------------------------
+# Output paths
+# -----------------------------------------------------------------------------
+outputs:
+  root_dir: "outputs_external_refactored"
+
+  manifest:
+    dir: "outputs_external_refactored/manifest"
+    external_manifest_csv: "outputs_external_refactored/manifest/external_manifest.csv"
+
+  audit:
+    dir: "outputs_external_refactored/audit"
+    per_image_csv: "outputs_external_refactored/audit/tiff_audit_per_image.csv"
+    per_slide_csv: "outputs_external_refactored/audit/tiff_audit_per_slide.csv"
+    summary_json: "outputs_external_refactored/audit/tiff_audit_summary.json"
+    raw_intensity_histograms: "outputs_external_refactored/audit/intensity_histograms_raw.png"
+
+  preprocessed:
+    locked_pixel_pipeline_dir: "outputs_external_refactored/preprocessed/locked_pixel_pipeline"
+    scale_matched_physical_pipeline_dir: "outputs_external_refactored/preprocessed/scale_matched_physical_pipeline"
+    photometric_mean_std_matched_pipeline_dir: "outputs_external_refactored/preprocessed/photometric_mean_std_matched_pipeline"
+    sidecar_dir: "outputs_external_refactored/preprocessing_sidecars"
+    preprocessing_metadata_filename: "preprocessing_metadata.json"
+
+  evaluation:
+    locked_pixel_pipeline_dir: "outputs_external_refactored/evaluation/locked_pixel_pipeline"
+    scale_matched_physical_pipeline_dir: "outputs_external_refactored/evaluation/scale_matched_physical_pipeline"
+    photometric_mean_std_matched_pipeline_dir: "outputs_external_refactored/evaluation/photometric_mean_std_matched_pipeline"
+    image_predictions_csv: "outputs_external_refactored/evaluation/locked_pixel_pipeline/image_predictions.csv"
+    slide_predictions_csv: "outputs_external_refactored/evaluation/locked_pixel_pipeline/slide_predictions.csv"
+    metrics_image_level_json: "outputs_external_refactored/evaluation/locked_pixel_pipeline/metrics_image_level.json"
+    metrics_slide_level_json: "outputs_external_refactored/evaluation/locked_pixel_pipeline/metrics_slide_level.json"
+    confusion_matrix_image_csv: "outputs_external_refactored/evaluation/locked_pixel_pipeline/confusion_matrix_image.csv"
+    confusion_matrix_slide_csv: "outputs_external_refactored/evaluation/locked_pixel_pipeline/confusion_matrix_slide.csv"
+    metadata_json: "outputs_external_refactored/evaluation/locked_pixel_pipeline/external_validation_metadata.json"
+
+  statistics:
+    locked_pixel_pipeline_dir: "outputs_external_refactored/statistics/locked_pixel_pipeline"
+    scale_matched_physical_pipeline_dir: "outputs_external_refactored/statistics/scale_matched_physical_pipeline"
+    photometric_mean_std_matched_pipeline_dir: "outputs_external_refactored/statistics/photometric_mean_std_matched_pipeline"
+    scale_sensitivity_comparison_dir: "outputs_external_refactored/statistics/scale_sensitivity_comparison"
+    photometric_sensitivity_comparison_dir: "outputs_external_refactored/statistics/photometric_sensitivity_comparison"
+
+  figures:
+    locked_pixel_pipeline_dir: "outputs_external_refactored/figures/locked_pixel_pipeline"
+    scale_matched_physical_pipeline_dir: "outputs_external_refactored/figures/scale_matched_physical_pipeline"
+    photometric_mean_std_matched_pipeline_dir: "outputs_external_refactored/figures/photometric_mean_std_matched_pipeline"
+
+# -----------------------------------------------------------------------------
+# Reproducibility and safety rules
+# -----------------------------------------------------------------------------
+reproducibility:
+  random_seed: 42
+  deterministic_preprocessing: true
+  deterministic_inference_order: true
+  save_config_snapshot_to_outputs: true
+  save_git_commit_if_available: true
+  save_package_versions: true
+
+scientific_guardrails:
+  no_retraining_on_external_data: true
+  no_fine_tuning_on_external_data: true
+  no_threshold_tuning_on_external_data: true
+  no_model_selection_on_external_data: true
+  no_preprocessing_selection_based_on_best_external_performance: true
+  no_train_test_split_of_external_dataset: true
+  keep_sensitivity_analyses_separate_from_primary: true
+  report_photometric_sensitivity_as_diagnostic_only: true
+  report_slide_level_metrics_as_primary: true
+  report_image_level_metrics_as_secondary_only: true
+  explicitly_report_12bit_training_vs_14bit_external: true
+  explicitly_report_pixel_spacing_shift: true
+  discuss_uncertainty_due_to_24_independent_slides: true
+
+# -----------------------------------------------------------------------------
+# Script execution order
+# -----------------------------------------------------------------------------
+execution_order:
+  - step: 1
+    name: "create_external_manifest"
+    script: "external_manifest.py"
+    command: >
+      python external_manifest.py
+      --input data/fungi.zip
+      --metadata configs/external_validation_metadata.json
+      --config configs/external_validation_config.yaml
+      --output outputs_external_refactored/manifest/external_manifest.csv
+
+  - step: 2
+    name: "audit_raw_tiffs"
+    script: "audit_external_tiffs.py"
+    command: >
+      python audit_external_tiffs.py
+      --manifest outputs_external_refactored/manifest/external_manifest.csv
+      --config configs/external_validation_config.yaml
+      --output-dir outputs_external_refactored/audit
+
+  - step: 3
+    name: "run_primary_preprocessing"
+    script: "preprocess_external.py"
+    command: >
+      python preprocess_external.py
+      --manifest outputs_external_refactored/manifest/external_manifest.csv
+      --checkpoint final_model_lsa_convtok.pth
+      --config configs/external_validation_config.yaml
+      --output-dir outputs_external_refactored/preprocessed/locked_pixel_pipeline
+      --mode locked_pixel_pipeline
+      --image-size 384
+      --post-resize-clip
+
+  - step: 4
+    name: "run_primary_external_evaluation"
+    script: "evaluate_external_generalization.py"
+    command: >
+      python evaluate_external_generalization.py
+      --checkpoint final_model_lsa_convtok.pth
+      --provenance-checkpoint final_model_checkpoint.pth
+      --manifest outputs_external_refactored/manifest/external_manifest.csv
+      --preprocessed-dir outputs_external_refactored/preprocessed/locked_pixel_pipeline
+      --config configs/external_validation_config.yaml
+      --output-dir outputs_external_refactored/evaluation/locked_pixel_pipeline
+      --batch-size 64
+
+  - step: 5
+    name: "compute_statistics_and_confidence_intervals"
+    script: "external_statistics.py"
+    command: >
+      python external_statistics.py
+      --image-predictions outputs_external_refactored/evaluation/locked_pixel_pipeline/image_predictions.csv
+      --slide-predictions outputs_external_refactored/evaluation/locked_pixel_pipeline/slide_predictions.csv
+      --manifest outputs_external_refactored/manifest/external_manifest.csv
+      --config configs/external_validation_config.yaml
+      --output-dir outputs_external_refactored/statistics/locked_pixel_pipeline
+      --n-bootstrap 10000
+      --tiff-audit-per-image outputs_external_refactored/audit/tiff_audit_per_image.csv
+      --tiff-audit-per-slide outputs_external_refactored/audit/tiff_audit_per_slide.csv
+
+  - step: 6
+    name: "run_scale_matched_sensitivity_preprocessing"
+    script: "preprocess_external.py"
+    sensitivity_analysis: true
+    command: >
+      python preprocess_external.py
+      --manifest outputs_external_refactored/manifest/external_manifest.csv
+      --checkpoint final_model_lsa_convtok.pth
+      --config configs/external_validation_config.yaml
+      --output-dir outputs_external_refactored/preprocessed/scale_matched_physical_pipeline
+      --mode scale_matched_physical_pipeline
+      --image-size 384
+      --scale-match-padding median
+      --training-pixel-spacing-um 0.175
+      --external-pixel-spacing-um 0.043
+      --scale-match-target-canvas-height-px 1200
+      --scale-match-target-canvas-width-px 1200
+      --post-resize-clip
+      --force
+
+  - step: 7
+    name: "run_scale_matched_sensitivity_evaluation"
+    script: "evaluate_external_generalization.py"
+    sensitivity_analysis: true
+    command: >
+      python evaluate_external_generalization.py
+      --checkpoint final_model_lsa_convtok.pth
+      --provenance-checkpoint final_model_checkpoint.pth
+      --manifest outputs_external_refactored/manifest/external_manifest.csv
+      --preprocessed-dir outputs_external_refactored/preprocessed/scale_matched_physical_pipeline
+      --config configs/external_validation_config.yaml
+      --output-dir outputs_external_refactored/evaluation/scale_matched_physical_pipeline
+      --batch-size 64
+      --preprocessing-mode scale_matched_physical_pipeline
+
+  - step: 8
+    name: "compute_scale_matched_sensitivity_statistics"
+    script: "external_statistics.py"
+    sensitivity_analysis: true
+    command: >
+      python external_statistics.py
+      --image-predictions outputs_external_refactored/evaluation/scale_matched_physical_pipeline/image_predictions.csv
+      --slide-predictions outputs_external_refactored/evaluation/scale_matched_physical_pipeline/slide_predictions.csv
+      --manifest outputs_external_refactored/manifest/external_manifest.csv
+      --config configs/external_validation_config.yaml
+      --output-dir outputs_external_refactored/statistics/scale_matched_physical_pipeline
+      --n-bootstrap 10000
+      --tiff-audit-per-image outputs_external_refactored/audit/tiff_audit_per_image.csv
+      --tiff-audit-per-slide outputs_external_refactored/audit/tiff_audit_per_slide.csv
+
+  - step: 9
+    name: "compare_primary_and_scale_matched_sensitivity"
+    script: "compare_external_pipelines.py"
+    sensitivity_analysis: true
+    command: >
+      python compare_external_pipelines.py
+      --primary-slide-predictions outputs_external_refactored/evaluation/locked_pixel_pipeline/slide_predictions.csv
+      --sensitivity-slide-predictions outputs_external_refactored/evaluation/scale_matched_physical_pipeline/slide_predictions.csv
+      --primary-label locked_pixel_pipeline
+      --sensitivity-label scale_matched_physical_pipeline
+      --output-dir outputs_external_refactored/statistics/scale_sensitivity_comparison
+
+  - step: 10
+    name: "run_photometric_sensitivity_preprocessing"
+    script: "preprocess_external.py"
+    sensitivity_analysis: true
+    command: >
+      python preprocess_external.py
+      --manifest outputs_external_refactored/manifest/external_manifest.csv
+      --checkpoint final_model_lsa_convtok.pth
+      --config configs/external_validation_config.yaml
+      --output-dir outputs_external_refactored/preprocessed/photometric_mean_std_matched_pipeline
+      --mode photometric_mean_std_matched_pipeline
+      --image-size 384
+      --post-resize-clip
+      --force
+
+  - step: 11
+    name: "run_photometric_sensitivity_evaluation"
+    script: "evaluate_external_generalization.py"
+    sensitivity_analysis: true
+    command: >
+      python evaluate_external_generalization.py
+      --checkpoint final_model_lsa_convtok.pth
+      --provenance-checkpoint final_model_checkpoint.pth
+      --manifest outputs_external_refactored/manifest/external_manifest.csv
+      --preprocessed-dir outputs_external_refactored/preprocessed/photometric_mean_std_matched_pipeline
+      --config configs/external_validation_config.yaml
+      --output-dir outputs_external_refactored/evaluation/photometric_mean_std_matched_pipeline
+      --batch-size 64
+      --preprocessing-mode photometric_mean_std_matched_pipeline
+
+  - step: 12
+    name: "compute_photometric_sensitivity_statistics"
+    script: "external_statistics.py"
+    sensitivity_analysis: true
+    command: >
+      python external_statistics.py
+      --image-predictions outputs_external_refactored/evaluation/photometric_mean_std_matched_pipeline/image_predictions.csv
+      --slide-predictions outputs_external_refactored/evaluation/photometric_mean_std_matched_pipeline/slide_predictions.csv
+      --manifest outputs_external_refactored/manifest/external_manifest.csv
+      --config configs/external_validation_config.yaml
+      --output-dir outputs_external_refactored/statistics/photometric_mean_std_matched_pipeline
+      --n-bootstrap 10000
+      --tiff-audit-per-image outputs_external_refactored/audit/tiff_audit_per_image.csv
+      --tiff-audit-per-slide outputs_external_refactored/audit/tiff_audit_per_slide.csv
+
+  - step: 13
+    name: "compare_primary_and_photometric_sensitivity"
+    script: "compare_external_pipelines.py"
+    sensitivity_analysis: true
+    command: >
+      python compare_external_pipelines.py
+      --primary-slide-predictions outputs_external_refactored/evaluation/locked_pixel_pipeline/slide_predictions.csv
+      --sensitivity-slide-predictions outputs_external_refactored/evaluation/photometric_mean_std_matched_pipeline/slide_predictions.csv
+      --primary-label locked_pixel_pipeline
+      --sensitivity-label photometric_mean_std_matched_pipeline
+      --output-dir outputs_external_refactored/statistics/photometric_sensitivity_comparison
+
+  - step: 14
+    name: "generate_primary_plots"
+    script: "external_plotting.py"
+    optional: true
+    required_for_core_validation: false
+    command: >
+      python external_plotting.py
+      --evaluation-dir outputs_external_refactored/evaluation/locked_pixel_pipeline
+      --statistics-dir outputs_external_refactored/statistics/locked_pixel_pipeline
+      --config configs/external_validation_config.yaml
+      --output-dir outputs_external_refactored/figures/locked_pixel_pipeline

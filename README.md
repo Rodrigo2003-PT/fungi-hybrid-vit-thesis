@@ -354,7 +354,7 @@ Two methods are available:
 
 | Method | Description | Recommended for |
 |---|---|---|
-| `baseline` | Linear normalisation only: `I_norm = I_raw / 4095` → [0, 1] | ✓ All paper results |
+| `baseline` | Linear normalisation only: `I_norm = I_raw / 4095` → [0, 1] | All paper results |
 | `optimized` | Baseline + BaSiCPy flatfield/darkfield correction | Ablation only |
 
 BaSiCPy is fitted **exclusively on training images** (identified via `split_indices.json`) to strictly prevent test-set signal from entering the illumination correction model.

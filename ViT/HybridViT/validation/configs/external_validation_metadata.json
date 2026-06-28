@@ -1,0 +1,122 @@
+{
+  "schema_version": "1.0",
+  "purpose": "Metadata for the frozen LSA-ConvTok Hybrid model. This file stores slide-level species annotations, C. albicans morphology subgroups, expected slide counts, acquisition-protocol metadata, training-domain reference metadata, and validation rules. It should be used by external_manifest.py to assign labels and metadata without hard-coding biological or acquisition annotations inside evaluation scripts.",
+  "dataset_role": "external_validation",
+  "domain": "external_new_microscope",
+  "label_mapping": {
+    "Candida albicans": 0,
+    "Candida glabrata": 1
+  },
+  "species_slide_sets": {
+    "Candida albicans": [
+      "20260508_alb_C",
+      "20260508_alb_D",
+      "20260508_alb_E",
+      "20260508_alb_F",
+      "20260508_alb_G",
+      "20260508_alb_H",
+      "20260508_alb_I",
+      "20260508_alb_J",
+      "20260508_alb_K",
+      "20260508_alb_L",
+      "20200528_alb_A",
+      "20260507_alb_B"
+    ],
+    "Candida glabrata": [
+      "20260507_gla_A",
+      "20260507_gla_B",
+      "20260507_gla_C",
+      "20260507_gla_D",
+      "20260507_gla_E",
+      "20260507_gla_F",
+      "20260507_gla_G",
+      "20260507_gla_H",
+      "20260507_gla_I",
+      "20260507_gla_J",
+      "20260507_gla_K",
+      "20260507_gla_L"
+    ]
+  },
+  "albicans_morphology_subgroups": {
+    "hyphae": [
+      "20260508_alb_H",
+      "20260508_alb_I",
+      "20260508_alb_J",
+      "20260508_alb_K",
+      "20260508_alb_L"
+    ],
+    "no_hyphae": [
+      "20200528_alb_A",
+      "20260507_alb_B",
+      "20260508_alb_C",
+      "20260508_alb_D",
+      "20260508_alb_E",
+      "20260508_alb_F",
+      "20260508_alb_G"
+    ],
+    "not_applicable": [
+      "20260507_gla_A",
+      "20260507_gla_B",
+      "20260507_gla_C",
+      "20260507_gla_D",
+      "20260507_gla_E",
+      "20260507_gla_F",
+      "20260507_gla_G",
+      "20260507_gla_H",
+      "20260507_gla_I",
+      "20260507_gla_J",
+      "20260507_gla_K",
+      "20260507_gla_L"
+    ]
+  },
+  "expected_slide_counts": {
+    "total_slides": 24,
+    "Candida albicans": 12,
+    "Candida glabrata": 12,
+    "Candida albicans with hyphae": 5,
+    "Candida albicans without hyphae": 7
+  },
+  "external_acquisition_metadata": {
+    "microscope": "Zeiss Axio Observer.Z1",
+    "objective": "Plan-Apochromat 63x/1.4 Oil",
+    "camera": "Axiocam 820, monochrome",
+    "illumination": "Brightfield, TL LED, 20%",
+    "software": "ZEN Blue",
+    "exposure_time_ms": 50,
+    "bit_depth": 14,
+    "pixel_spacing_um": {
+      "x": 0.043,
+      "y": 0.043
+    },
+    "sample_preparation": "Agar pad technique with 1.7% agarose and 5 µL culture.",
+    "sampling_strategy": "Images acquired from random areas of each slide; approximately 62 images per slide; focus manually optimized per slide and then kept constant.",
+    "calibration": "No calibration performed."
+  },
+  "training_domain_reference": {
+    "bit_depth": 12,
+    "pixel_spacing_um": {
+      "x": 0.175,
+      "y": 0.175
+    },
+    "purpose": "Stored only to document the acquisition-domain shift relative to the training domain. It must not be used to normalize external raw TIFF values."
+  },
+  "domain_shift_metadata": {
+    "external_to_training_pixel_spacing_ratio": 4.069767,
+    "interpretation": "The external images have approximately 4.07 times smaller pixel spacing per linear dimension than the original training-domain images; this should be treated as a geometric scale shift in addition to camera, illumination, exposure, and bit-depth shifts."
+  },
+  "validation_rules": {
+    "all_listed_slides_must_exist_in_manifest": true,
+    "no_slide_id_may_have_mixed_species_labels": true,
+    "albicans_hyphae_and_no_hyphae_sets_must_be_disjoint": true,
+    "all_albicans_slides_must_have_hyphae_status": true,
+    "glabrata_slides_must_have_hyphae_status": "not_applicable",
+    "external_dataset_must_not_be_split_for_training": true
+  },
+  "quality_control_notes": [
+    "Use slide_id as the independent biological/acquisition unit for primary statistics.",
+    "Use image-level metrics only as descriptive secondary analyses.",
+    "Do not infer or modify hyphae status from model predictions.",
+    "Slide identifiers are preserved exactly as provided by the laboratory/user and should be matched literally against the raw filenames."
+  ],
+  "metadata_role": "external_validation_slide_and_acquisition_metadata"
+}
