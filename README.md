@@ -267,8 +267,7 @@ fungi-hybrid-vit/
 │           ├── Run.ipynb                    # Validation entry point (Colab notebook)
 │           │
 │           ├── models/
-│           │   ├── final_model_checkpoint.pth   # Best CV checkpoint (reference)
-│           │   └── final_model_lsa_convtok.pth  # Final production model (trained on full S_train)
+│           │   ├── final_model_lsa_convtok.pth  # Final production model (trained on full S_train)
 │           │
 │           ├── data/
 │           │   └── fungi.zip                # External cohort preprocessed images
