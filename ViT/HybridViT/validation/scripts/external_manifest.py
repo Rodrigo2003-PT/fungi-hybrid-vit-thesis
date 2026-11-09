@@ -27,6 +27,11 @@ The script:
     5. Writes an image-level CSV manifest and a JSON validation summary.
     6. Fails loudly in strict mode if the observed slides do not match the
        pre-specified metadata and expected cohort structure.
+    7. Validates the optical acquisition primitives in metadata ``optics``
+       (rules O-1, O-2, O-3, O-6 in optics_provenance.py) and records the
+       derived geometry as descriptive provenance in the summary JSON.
+    8. Reports the acquisition-date x species structure of the cohort, because
+       acquisition day is confounded with species in this cohort (F-02).
 
 Inputs
 ------
@@ -40,14 +45,7 @@ Outputs
     - external_manifest_summary.json
     - optional extracted raw dataset directory if input is a ZIP
 
-Example
--------
-    python external_manifest.py \
-        --input fungi.zip \
-        --metadata configs/external_validation_metadata.json \
-        --output outputs_external/manifest/external_manifest.csv
-
-Author: Rodrigo Sá / generated implementation
+Author: Rodrigo Sá
 Date: 2026
 """
 
@@ -57,7 +55,6 @@ import argparse
 import csv
 import hashlib
 import json
-import os
 import re
 import shutil
 import sys
@@ -65,7 +62,9 @@ import time
 import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+from optics_provenance import optics_provenance_record
 
 
 SUPPORTED_TIFF_EXTENSIONS = {".tif", ".tiff", ".TIF", ".TIFF"}
@@ -94,9 +93,6 @@ MANIFEST_COLUMNS = [
     "software",
     "training_domain_bit_depth",
     "external_domain_bit_depth",
-    "training_pixel_spacing_um",
-    "external_pixel_spacing_um",
-    "scale_factor_external_to_training",
     "training_illumination",
     "external_illumination",
     "training_exposure_ms",
@@ -110,12 +106,14 @@ MANIFEST_COLUMNS = [
     "source_input_sha256",
 ]
 
+MANIFEST_SCHEMA_VERSION = "2.0"
+CONFOUNDING_WARNING_THRESHOLD = 0.75
 SUMMARY_FILENAME = "external_manifest_summary.json"
 CONFIG_SNAPSHOT_FILENAME = "external_validation_config_snapshot.yaml"
 METADATA_SNAPSHOT_FILENAME = "external_validation_metadata_snapshot.json"
 
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Create a strict image-level external-validation manifest from a "
@@ -201,7 +199,11 @@ def parse_args() -> argparse.Namespace:
             "Not recommended for final thesis runs."
         ),
     )
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    return build_arg_parser().parse_args(argv)
 
 
 def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
@@ -444,37 +446,6 @@ def build_expected_slide_maps(metadata: Dict[str, Any]) -> Tuple[Dict[str, str],
     return slide_to_species, slide_to_hyphae
 
 
-def get_float_spacing(spacing_obj: Any, axis: str = "x") -> Optional[float]:
-    if isinstance(spacing_obj, dict):
-        v = spacing_obj.get(axis)
-        return float(v) if v is not None else None
-    if isinstance(spacing_obj, (int, float)):
-        return float(spacing_obj)
-    return None
-
-
-def compute_scale_factor(metadata: Dict[str, Any]) -> Optional[float]:
-    domain_shift = metadata.get("domain_shift_metadata", {})
-    if isinstance(domain_shift, dict):
-        val = domain_shift.get("external_to_training_pixel_spacing_ratio")
-        if val is not None:
-            return float(val)
-
-    train = metadata.get("training_domain_reference", {})
-    ext = metadata.get("external_acquisition_metadata", {})
-    train_x = get_float_spacing(train.get("pixel_spacing_um"), "x") if isinstance(train, dict) else None
-    ext_x = get_float_spacing(ext.get("pixel_spacing_um"), "x") if isinstance(ext, dict) else None
-    if train_x is not None and ext_x is not None and ext_x > 0:
-        return float(train_x / ext_x)
-    return None
-
-
-def as_scalar_spacing(spacing_obj: Any) -> str:
-    """Return 'x' spacing as a scalar string for downstream CSV compatibility."""
-    val = get_float_spacing(spacing_obj, "x")
-    return "" if val is None else f"{val:.12g}"
-
-
 def create_manifest_rows(
     image_paths: List[Path],
     dataset_root: Path,
@@ -502,7 +473,6 @@ def create_manifest_rows(
 
     domain = str(metadata.get("domain", "external_new_microscope"))
     dataset_role = str(metadata.get("dataset_role", "external_validation"))
-    scale_factor = compute_scale_factor(metadata)
 
     rows: List[Dict[str, Any]] = []
     seen_rel_paths: Set[str] = set()
@@ -601,9 +571,6 @@ def create_manifest_rows(
             "software": external.get("software", ""),
             "training_domain_bit_depth": training.get("bit_depth", ""),
             "external_domain_bit_depth": external.get("bit_depth", external.get("bit_depth_reported_by_lab", "")),
-            "training_pixel_spacing_um": as_scalar_spacing(training.get("pixel_spacing_um")),
-            "external_pixel_spacing_um": as_scalar_spacing(external.get("pixel_spacing_um")),
-            "scale_factor_external_to_training": "" if scale_factor is None else f"{scale_factor:.12g}",
             "training_illumination": training.get("illumination", ""),
             "external_illumination": external.get("illumination", ""),
             "training_exposure_ms": training.get("exposure_time_ms", ""),
@@ -788,12 +755,12 @@ def validate_manifest_rows(
 
 def enrich_metadata_from_config(metadata: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Fill missing acquisition/reference fields in metadata from the YAML config.
+    Fill missing descriptive acquisition fields in metadata from the YAML config.
 
-    The JSON metadata remains the authority for slide IDs, labels, and hyphae
-    status. The YAML config is only used as a non-destructive fallback for
-    acquisition-domain descriptors such as microscope, camera, illumination,
-    exposure, and pixel spacing.
+    The JSON metadata remains the authority for slide IDs, labels, hyphae
+    status and optical primitives (``optics``). The config only supplies
+    non-destructive defaults for descriptors such as microscope, camera,
+    illumination and exposure. Optical geometry is never taken from the config.
     """
     if not config:
         return metadata
@@ -802,7 +769,6 @@ def enrich_metadata_from_config(metadata: Dict[str, Any], config: Dict[str, Any]
 
     cfg_train = config.get("training_domain_reference", {})
     cfg_ext = config.get("external_domain", {})
-    cfg_domain_shift = config.get("domain_shift", {})
 
     if isinstance(cfg_train, dict):
         train = enriched.setdefault("training_domain_reference", {})
@@ -818,16 +784,101 @@ def enrich_metadata_from_config(metadata: Dict[str, Any], config: Dict[str, Any]
                     ext["bit_depth"] = v
                 ext.setdefault(k, v)
 
-    if isinstance(cfg_domain_shift, dict):
-        ds = enriched.setdefault("domain_shift_metadata", {})
-        if isinstance(ds, dict):
-            px = cfg_domain_shift.get("pixel_spacing")
-            if isinstance(px, dict):
-                ratio = px.get("external_to_training_linear_scale_factor")
-                if ratio is not None:
-                    ds.setdefault("external_to_training_pixel_spacing_ratio", ratio)
-
     return enriched
+
+
+def validate_optics_block(metadata: Dict[str, Any], *, strict: bool) -> Tuple[Dict[str, Any], List[str], List[str]]:
+    """
+    Validate metadata ``optics`` (O-1, O-2, O-3, O-6) and build the provenance
+    record. Unfilled AUTHOR_TO_* placeholders are errors in strict runs and
+    warnings otherwise. Returns (record, warnings, errors).
+    """
+    warnings_out: List[str] = []
+    errors: List[str] = []
+    optics = metadata.get("optics")
+    if not isinstance(optics, dict):
+        errors.append("Metadata has no 'optics' block; optical provenance cannot be validated (schema 2.0 required).")
+        return {"validation": {"ok": False}, "optics_sha256": None}, warnings_out, errors
+
+    record = optics_provenance_record(optics)
+    validation = record["validation"]
+    errors.extend(validation["errors"])
+    for item in validation["pending_author_input"]:
+        (errors if strict else warnings_out).append(f"Pending author input: {item}")
+    warnings_out.extend(validation["warnings"])
+    warnings_out.extend(validation["provenance_gaps"])
+    return record, warnings_out, errors
+
+
+def acquisition_date_structure(
+    rows: List[Dict[str, Any]],
+    acquisition_window: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Slide-level acquisition-date x species structure (F-02).
+
+    Acquisition day is a batch variable (illumination, preparation, focus). When
+    a date contains slides of only one species, any day-level effect is
+    inseparable from species. This is reported descriptively; it cannot be
+    corrected by code.
+    """
+    warnings_out: List[str] = []
+    slide_date: Dict[str, str] = {}
+    slide_species: Dict[str, str] = {}
+    for r in rows:
+        slide_date[str(r["slide_id"])] = str(r["acquisition_date"])
+        slide_species[str(r["slide_id"])] = str(r["species_name"])
+
+    table: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for sid, date in slide_date.items():
+        table[date][slide_species[sid]] += 1
+    cross_tab = {d: dict(sorted(v.items())) for d, v in sorted(table.items())}
+
+    mixed_dates = sorted(d for d, v in cross_tab.items() if len(v) > 1)
+    single_species_slides = sum(
+        n for d, v in cross_tab.items() if len(v) == 1 for n in v.values()
+    )
+    n_slides = len(slide_date)
+    # Accuracy of predicting species from acquisition date alone (majority
+    # species per date). 0.5 = no association for a balanced cohort; 1.0 =
+    # date fully determines species.
+    majority_correct = sum(max(v.values()) for v in cross_tab.values())
+    date_predicts_species = majority_correct / n_slides if n_slides else None
+
+    out_of_window: List[str] = []
+    if isinstance(acquisition_window, dict):
+        start = str(acquisition_window.get("start", "")) or None
+        end = str(acquisition_window.get("end", "")) or None
+        for sid, date in sorted(slide_date.items()):
+            if (start and date < start) or (end and date > end):
+                out_of_window.append(sid)
+        if out_of_window:
+            warnings_out.append(
+                f"Acquisition date outside expected window [{start}, {end}] for slides {out_of_window}. "
+                "Verify against the TIFF DateTime tag and lab records (PARTIAL)."
+            )
+
+    separated = len(mixed_dates) == 0 and len(cross_tab) > 1
+    if separated or (date_predicts_species is not None and date_predicts_species >= CONFOUNDING_WARNING_THRESHOLD):
+        warnings_out.append(
+            f"Acquisition date is confounded with species: date alone predicts species for "
+            f"{majority_correct}/{n_slides} slides ({date_predicts_species:.3f}). Day-level effects "
+            "(illumination, preparation, focus) cannot be separated from species."
+        )
+
+    return {
+        "acquisition_date_by_species": cross_tab,
+        "confounding_flags": {
+            "species_perfectly_separated_by_date": bool(separated),
+            "dates_with_both_species": mixed_dates,
+            "n_slides_on_single_species_dates": int(single_species_slides),
+            "date_predicts_species_accuracy": date_predicts_species,
+            "warning_threshold": CONFOUNDING_WARNING_THRESHOLD,
+            "n_slides": int(n_slides),
+            "slides_outside_expected_acquisition_window": out_of_window,
+        },
+    }, warnings_out
+
 
 def make_summary(
     *,
@@ -841,9 +892,11 @@ def make_summary(
     errors: List[str],
     elapsed_seconds: float,
     source_sha256: str,
+    optics_record: Dict[str, Any],
+    date_structure: Dict[str, Any],
 ) -> Dict[str, Any]:
     return {
-        "schema_version": "1.0",
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "script": "external_manifest.py",
         "scientific_role": (
             "Authoritative image-level manifest for an independent external "
@@ -853,7 +906,9 @@ def make_summary(
             "raw_input": str(args.input),
             "raw_input_sha256": source_sha256,
             "metadata_json": str(args.metadata),
+            "metadata_json_sha256": sha256_file(args.metadata),
             "config_yaml": str(args.config) if args.config else None,
+            "config_yaml_sha256": sha256_file(args.config) if args.config else None,
         },
         "outputs": {
             "manifest_csv": str(args.output),
@@ -866,16 +921,20 @@ def make_summary(
             "allow_missing_listed_slides": bool(args.allow_missing_listed_slides),
         },
         "metadata_role": metadata.get("metadata_role", "external_validation_slide_and_acquisition_metadata"),
+        "metadata_schema_version": metadata.get("schema_version"),
         "dataset_role": metadata.get("dataset_role", "external_validation"),
         "domain": metadata.get("domain", "external_new_microscope"),
         "label_mapping": metadata.get("label_mapping", {}),
         "expected_slide_counts": metadata.get("expected_slide_counts", {}),
         "counts": counts,
+        "optics": optics_record,
+        **date_structure,
         "guardrails": {
             "no_train_test_split_created": True,
             "labels_from_metadata_and_folder_names_only": True,
             "hyphae_status_used_for_subgroup_analysis_only": True,
             "model_predictions_used": False,
+            "optics_used_to_transform_pixels": False,
         },
         "validation_status": "passed" if not errors else "failed",
         "warnings": warnings_out,
@@ -952,8 +1011,14 @@ def main() -> None:
         allow_unlisted_slides=args.allow_unlisted_slides,
     )
 
-    warnings_out = row_warnings + val_warnings
-    errors = row_errors + val_errors
+    optics_record, optics_warnings, optics_errors = validate_optics_block(metadata, strict=bool(args.strict))
+    date_structure, date_warnings = acquisition_date_structure(
+        rows,
+        get_nested(config, ["expected_external_cohort", "expected_acquisition_window"], None),
+    )
+
+    warnings_out = row_warnings + val_warnings + optics_warnings + date_warnings
+    errors = row_errors + val_errors + optics_errors
     elapsed = time.time() - start
 
     summary = make_summary(
@@ -967,6 +1032,8 @@ def main() -> None:
         errors=errors,
         elapsed_seconds=elapsed,
         source_sha256=source_sha256,
+        optics_record=optics_record,
+        date_structure=date_structure,
     )
 
     # Always write summary for debugging, even on strict failure.
@@ -994,6 +1061,11 @@ def main() -> None:
     print(f"Slides       : {counts.get('n_slides')}")
     print(f"Species slides: {counts.get('species_slide_counts')}")
     print(f"Hyphae slides : {counts.get('hyphae_slide_counts')}")
+    derived_ext = (optics_record.get("derived", {}) or {}).get("external", {})
+    if derived_ext:
+        print(f"External pixel spacing (derived): {derived_ext.get('pixel_spacing_um'):.8f} µm/px")
+        print(f"External FOV (derived)          : {derived_ext.get('fov_um')[0]:.3f} µm")
+    print(f"Optics sha256 : {optics_record.get('optics_sha256')}")
     if warnings_out:
         print(f"Warnings     : {len(warnings_out)}; see summary JSON")
     print("No train/test split was created; all slides remain external validation data.")

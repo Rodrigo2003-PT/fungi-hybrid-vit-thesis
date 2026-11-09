@@ -21,6 +21,21 @@ thresholds, or select models. Its role is to quantify:
     5. Calibration/confidence summaries.
     6. Optional raw TIFF/domain-shift summaries when audit files are provided.
 
+Interval methods (F-06)
+-----------------------
+With n = 24 slides, percentile bootstrap intervals under-cover and collapse to
+zero width when predictions are constant within a class. Therefore:
+    * accuracy and per-class recall: exact Clopper-Pearson intervals (primary);
+    * AUROC: DeLong variance with a Wald interval (primary);
+    * every bootstrap interval reports ``bootstrap_sd`` and ``ci_degenerate``;
+      degenerate intervals are reported as null with the reason;
+    * ECE is flagged ``ece_reliable = False`` below 100 slides.
+
+Acquisition-date structure (F-02)
+---------------------------------
+Species is strongly confounded with acquisition date in this cohort. A
+descriptive per-date subgroup table is written; no inferential test is made.
+
 Why slide-level bootstrap?
 --------------------------
 Images from the same slide are correlated and must not be treated as independent
@@ -47,17 +62,8 @@ Outputs
       calibration_statistics.json
       confidence_by_slide.csv
       error_analysis_slide_level.csv
+      subgroup_by_acquisition_date.csv
       optional_domain_shift_statistics.json
-
-Usage
------
-    python external_statistics.py \\
-        --image-predictions outputs_external/evaluation/locked_pixel_pipeline/image_predictions.csv \\
-        --slide-predictions outputs_external/evaluation/locked_pixel_pipeline/slide_predictions.csv \\
-        --manifest outputs_external/manifest/external_manifest.csv \\
-        --config configs/external_validation_config.yaml \\
-        --output-dir outputs_external/statistics/locked_pixel_pipeline \\
-        --n-bootstrap 10000
 
 Author: Rodrigo Sá
 Date: 2026
@@ -73,10 +79,18 @@ import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from optics_provenance import acquisition_date_from_slide_id
+from pipeline_common import expected_cohort_counts, load_optional_yaml, read_json
+from validation_stats import (
+    clopper_pearson_ci,
+    delong_auc_ci,
+    percentile_interval,
+    stratified_bootstrap_indices,
+)
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -88,6 +102,18 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+
+STATISTICS_SCHEMA_VERSION = "2.0"
+ECE_RELIABLE_MIN_N = 100
+
+DATE_SUBGROUP_COLUMNS = [
+    "acquisition_date",
+    "n_slides",
+    "species_slide_counts",
+    "slide_accuracy",
+    "n_misclassified_slides",
+    "misclassified_slide_ids",
+]
 
 SLIDE_METRIC_NAMES = [
     "accuracy",
@@ -150,7 +176,7 @@ ERROR_ANALYSIS_COLUMNS = [
 ]
 
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Compute slide-level confidence intervals, subgroup/error analysis, "
@@ -181,6 +207,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional external_validation_config.yaml.",
+    )
+    parser.add_argument(
+        "--metadata",
+        type=Path,
+        default=None,
+        help="Optional external_validation_metadata.json (expected cohort counts).",
     )
     parser.add_argument(
         "--output-dir",
@@ -230,25 +262,11 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Abort on severe consistency errors.",
     )
-    return parser.parse_args()
+    return parser
 
 
-def load_optional_yaml_config(path: Optional[Path]) -> Dict[str, Any]:
-    if path is None:
-        return {}
-    if not path.exists():
-        raise FileNotFoundError(f"Config YAML not found: {path}")
-    try:
-        import yaml
-    except ImportError:
-        print(
-            "WARNING: PyYAML not installed; continuing without parsing YAML config.",
-            file=sys.stderr,
-        )
-        return {}
-    with path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    return data if isinstance(data, dict) else {}
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    return build_arg_parser().parse_args(argv)
 
 
 def read_csv_dicts(path: Path) -> List[Dict[str, str]]:
@@ -308,6 +326,7 @@ def validate_prediction_files(
     manifest_rows: List[Dict[str, str]],
     *,
     strict: bool,
+    expected_total: Optional[int] = None,
 ) -> List[str]:
     warnings_out: List[str] = []
     errors: List[str] = []
@@ -374,12 +393,19 @@ def validate_prediction_files(
         if len(srows) != 1:
             errors.append(f"Expected one slide prediction row for {sid}, got {len(srows)}.")
 
-    if len(pred_slides) != 24:
-        msg = f"Expected 24 external slides, observed {len(pred_slides)}."
+    if expected_total is None:
+        warnings_out.append("No expected slide count available (metadata/config); count check skipped.")
+    elif len(pred_slides) != int(expected_total):
+        msg = f"Expected {expected_total} external slides, observed {len(pred_slides)}."
         if strict:
             errors.append(msg)
         else:
             warnings_out.append(msg)
+
+    manifest_label = {r["slide_id"]: str(r["label"]) for r in manifest_rows}
+    for r in slide_rows:
+        if r["slide_id"] in manifest_label and str(to_int(r["true_label"])) != str(to_int(manifest_label[r["slide_id"]])):
+            errors.append(f"True label of slide {r['slide_id']} differs from manifest label.")
 
     if errors and strict:
         raise RuntimeError("Prediction validation failed:\n  - " + "\n  - ".join(errors))
@@ -477,92 +503,84 @@ def slide_level_bootstrap_ci(
     ci: float,
     seed: int,
     stratified: bool,
-) -> Tuple[Dict[str, Dict[str, Optional[float]]], List[Dict[str, Any]]]:
+) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Bootstrap confidence intervals by resampling slides, not images.
+    Slide-resampling bootstrap with degeneracy reporting.
 
-    Parameters
-    ----------
-    slide_rows:
-        One row per slide.
-    stratified:
-        If true, sample with replacement within each true class, preserving
-        external cohort class counts in every bootstrap replicate.
+    Stratified replicates use ``validation_stats.stratified_bootstrap_indices``
+    (one rng.choice per class, classes ascending), which reproduces the
+    original resampling order exactly. A zero-variance bootstrap distribution
+    yields ``ci_degenerate = True`` and null bounds.
     """
     rng = np.random.default_rng(seed)
-
-    y_true_all, y_pred_all, p_pos_all = arrays_from_rows(
-        slide_rows,
-        probability_column="mean_prob_glabrata",
-    )
-
-    slide_indices_by_class: Dict[int, np.ndarray] = {}
-    for cls in sorted(np.unique(y_true_all)):
-        slide_indices_by_class[int(cls)] = np.where(y_true_all == int(cls))[0]
-
-    alpha = 1.0 - float(ci)
-    lo_q = 100.0 * alpha / 2.0
-    hi_q = 100.0 * (1.0 - alpha / 2.0)
+    y_true_all, y_pred_all, p_pos_all = arrays_from_rows(slide_rows, probability_column="mean_prob_glabrata")
+    all_indices = np.arange(len(slide_rows))
 
     distributions: Dict[str, List[float]] = {name: [] for name in SLIDE_METRIC_NAMES}
     rows_out: List[Dict[str, Any]] = []
-
-    all_indices = np.arange(len(slide_rows))
-
     for b in range(int(n_bootstrap)):
         if stratified:
-            sampled_parts = []
-            for cls, idxs in slide_indices_by_class.items():
-                sampled = rng.choice(idxs, size=len(idxs), replace=True)
-                sampled_parts.append(sampled)
-            boot_idx = np.concatenate(sampled_parts)
+            boot_idx = stratified_bootstrap_indices(y_true_all, rng)
         else:
             boot_idx = rng.choice(all_indices, size=len(all_indices), replace=True)
-
-        y_true = y_true_all[boot_idx]
-        y_pred = y_pred_all[boot_idx]
-        p_pos = p_pos_all[boot_idx]
-
-        metrics = compute_binary_metrics(y_true, y_pred, p_pos, unit="bootstrap_slide")
+        metrics = compute_binary_metrics(y_true_all[boot_idx], y_pred_all[boot_idx], p_pos_all[boot_idx],
+                                         unit="bootstrap_slide")
         boot_row: Dict[str, Any] = {"bootstrap_index": b}
-
         for name in SLIDE_METRIC_NAMES:
             value = metrics.get(name)
-            if value is None:
-                value = float("nan")
-            value = float(value)
+            value = float("nan") if value is None else float(value)
             distributions[name].append(value)
             boot_row[name] = value
-
         rows_out.append(boot_row)
 
-    ci_out: Dict[str, Dict[str, Optional[float]]] = {}
     point_metrics = compute_binary_metrics(y_true_all, y_pred_all, p_pos_all, unit="slide")
-
+    ci_out: Dict[str, Dict[str, Any]] = {}
     for name, values in distributions.items():
-        arr = np.asarray(values, dtype=float)
-        arr = arr[np.isfinite(arr)]
         point = point_metrics.get(name)
-        point_float = None if point is None else float(point)
-
-        if arr.size == 0:
-            ci_out[name] = {
-                "point_estimate": point_float,
-                "ci_lower": None,
-                "ci_upper": None,
-                "bootstrap_mean": None,
-                "n_valid_bootstrap": 0,
-            }
-        else:
-            ci_out[name] = {
-                "point_estimate": point_float,
-                "ci_lower": float(np.percentile(arr, lo_q)),
-                "ci_upper": float(np.percentile(arr, hi_q)),
-                "bootstrap_mean": float(np.mean(arr)),
-                "n_valid_bootstrap": int(arr.size),
-            }
-
+        ci_out[name] = {
+            "point_estimate": None if point is None else float(point),
+            "method": "percentile_bootstrap_" + ("class_stratified" if stratified else "unstratified"),
+            **percentile_interval(values, ci),
+        }
     return ci_out, rows_out
+
+
+def exact_and_delong_intervals(slide_rows: List[Dict[str, str]], ci: float) -> Dict[str, Any]:
+    """Primary small-sample intervals: Clopper-Pearson (proportions) and DeLong (AUROC)."""
+    y_true, y_pred, p_pos = arrays_from_rows(slide_rows, probability_column="mean_prob_glabrata")
+    correct = (y_true == y_pred)
+    out: Dict[str, Any] = {
+        "accuracy": clopper_pearson_ci(int(correct.sum()), int(correct.size), ci),
+        "auroc": delong_auc_ci(y_true, p_pos, ci),
+    }
+    for cls, name in [(0, "Candida_albicans"), (1, "Candida_glabrata")]:
+        mask = y_true == cls
+        if mask.any():
+            out[f"sensitivity_recall_{name}"] = clopper_pearson_ci(int(correct[mask].sum()), int(mask.sum()), ci)
+    return out
+
+
+def acquisition_date_subgroups(slide_rows: List[Dict[str, str]], manifest_rows: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Descriptive per-acquisition-date slide accuracy (F-02 confounding transparency)."""
+    date_by_slide = {
+        r["slide_id"]: (r.get("acquisition_date") or acquisition_date_from_slide_id(r["slide_id"]) or "unknown")
+        for r in manifest_rows
+    }
+    groups: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    for r in slide_rows:
+        groups[str(date_by_slide.get(r["slide_id"], acquisition_date_from_slide_id(r["slide_id"]) or "unknown"))].append(r)
+    out = []
+    for date, rows in sorted(groups.items()):
+        wrong = [r["slide_id"] for r in rows if to_int(r["correct"]) == 0]
+        out.append({
+            "acquisition_date": date,
+            "n_slides": len(rows),
+            "species_slide_counts": json.dumps(dict(sorted(Counter(r["species_name"] for r in rows).items()))),
+            "slide_accuracy": float(np.mean([to_int(r["correct"]) for r in rows])),
+            "n_misclassified_slides": len(wrong),
+            "misclassified_slide_ids": "|".join(wrong),
+        })
+    return out
 
 
 def true_class_probability(row: Dict[str, Any], *, level: str) -> float:
@@ -801,6 +819,10 @@ def calibration_statistics(
 
     out["ece_image"] = expected_calibration_error(correct_img, conf_img, n_bins=n_bins)
     out["ece_slide"] = expected_calibration_error(correct_slide, conf_slide, n_bins=n_bins)
+    out["ece_slide"]["ece_reliable"] = bool(len(slide_rows) >= ECE_RELIABLE_MIN_N)
+    out["ece_slide"]["reliability_note"] = (
+        f"ECE with {n_bins} bins over {len(slide_rows)} slides is unstable; report per-bin n and treat as descriptive."
+    )
 
     for level, conf, corr in [("image", conf_img, correct_img), ("slide", conf_slide, correct_slide)]:
         correct_conf = conf[corr == 1]
@@ -909,7 +931,8 @@ def create_summary(
     *,
     args: argparse.Namespace,
     config: Dict[str, Any],
-    slide_metrics_ci: Dict[str, Dict[str, Optional[float]]],
+    slide_metrics_ci: Dict[str, Dict[str, Any]],
+    exact_intervals: Dict[str, Any],
     image_metrics: Dict[str, Any],
     subgroup_rows: List[Dict[str, Any]],
     calibration: Dict[str, Any],
@@ -918,7 +941,7 @@ def create_summary(
     elapsed_seconds: float,
 ) -> Dict[str, Any]:
     return {
-        "schema_version": "1.0",
+        "schema_version": STATISTICS_SCHEMA_VERSION,
         "script": "external_statistics.py",
         "created_unix_time": time.time(),
         "elapsed_seconds": elapsed_seconds,
@@ -931,6 +954,7 @@ def create_summary(
             "slide_predictions": str(args.slide_predictions),
             "manifest": str(args.manifest),
             "config": str(args.config) if args.config else None,
+            "metadata": str(args.metadata) if args.metadata else None,
             "tiff_audit_per_image": str(args.tiff_audit_per_image) if args.tiff_audit_per_image else None,
             "tiff_audit_per_slide": str(args.tiff_audit_per_slide) if args.tiff_audit_per_slide else None,
         },
@@ -942,6 +966,7 @@ def create_summary(
             "stratified_by_true_class": bool(args.stratified_bootstrap),
             "images_bootstrapped_independently": False,
         },
+        "primary_slide_metrics_exact_intervals": exact_intervals,
         "primary_slide_metrics_with_ci": slide_metrics_ci,
         "secondary_image_metrics_descriptive": image_metrics,
         "subgroup_statistics": subgroup_rows,
@@ -965,6 +990,7 @@ def create_summary(
             "calibration_statistics_json": str(args.output_dir / "calibration_statistics.json"),
             "confidence_by_slide_csv": str(args.output_dir / "confidence_by_slide.csv"),
             "error_analysis_slide_level_csv": str(args.output_dir / "error_analysis_slide_level.csv"),
+            "subgroup_by_acquisition_date_csv": str(args.output_dir / "subgroup_by_acquisition_date.csv"),
             "optional_domain_shift_statistics_json": str(args.output_dir / "optional_domain_shift_statistics.json"),
         },
     }
@@ -979,12 +1005,18 @@ def print_summary(summary: Dict[str, Any]) -> None:
     print("=" * 80)
     print(f"Output directory : {Path(summary['outputs']['external_statistics_summary_json']).parent}")
     print(f"Bootstrap        : {summary['bootstrap']['n_bootstrap']} slide-level resamples")
-    print("\nPrimary slide-level metrics with CI:")
+    exact = summary["primary_slide_metrics_exact_intervals"]
+    acc = exact["accuracy"]
+    print(f"Accuracy (Clopper-Pearson): {acc['point_estimate']:.4f} [{acc['ci_lower']:.4f}, {acc['ci_upper']:.4f}]")
+    auc = exact["auroc"]
+    print(f"AUROC (DeLong)            : {auc.get('auc')} [{auc.get('ci_lower')}, {auc.get('ci_upper')}]")
+    print("\nPrimary slide-level metrics with bootstrap CI:")
     for name in ["accuracy", "balanced_accuracy", "matthews_corrcoef", "weighted_f1", "auroc"]:
         ci = slide.get(name, {})
         print(
             f"  - {name}: {ci.get('point_estimate')} "
             f"[{ci.get('ci_lower')}, {ci.get('ci_upper')}]"
+            + (" (degenerate)" if ci.get("ci_degenerate") else "")
         )
     print("\nSecondary image-level descriptive metrics:")
     for name in ["accuracy", "balanced_accuracy", "matthews_corrcoef", "weighted_f1", "auroc"]:
@@ -1003,7 +1035,9 @@ def main() -> None:
     start = time.time()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    config = load_optional_yaml_config(args.config)
+    config = load_optional_yaml(args.config)
+    metadata_json = read_json(args.metadata) if args.metadata else None
+    expected_total, _, _ = expected_cohort_counts(metadata_json, config)
 
     image_rows = read_csv_dicts(args.image_predictions)
     slide_rows = read_csv_dicts(args.slide_predictions)
@@ -1014,7 +1048,9 @@ def main() -> None:
         slide_rows,
         manifest_rows,
         strict=args.strict,
+        expected_total=expected_total,
     )
+    slide_rows = sorted(slide_rows, key=lambda r: r["slide_id"])
 
     # Metrics.
     y_true_img, y_pred_img, p_gla_img = arrays_from_rows(
@@ -1040,6 +1076,8 @@ def main() -> None:
         stratified=args.stratified_bootstrap,
     )
 
+    exact_intervals = exact_and_delong_intervals(slide_rows, args.ci)
+    date_rows = acquisition_date_subgroups(slide_rows, manifest_rows)
     subgroup_rows = subgroup_statistics(image_rows, slide_rows)
     calib = calibration_statistics(image_rows, slide_rows, n_bins=10)
     confidence_rows = confidence_by_slide(slide_rows)
@@ -1055,6 +1093,7 @@ def main() -> None:
         args=args,
         config=config,
         slide_metrics_ci=slide_metrics_ci,
+        exact_intervals=exact_intervals,
         image_metrics=image_metrics,
         subgroup_rows=subgroup_rows,
         calibration=calib,
@@ -1062,16 +1101,21 @@ def main() -> None:
         validation_warnings=validation_warnings,
         elapsed_seconds=elapsed,
     )
+    summary["subgroup_by_acquisition_date"] = date_rows
 
     # Write outputs.
     write_json(summary, args.output_dir / "external_statistics_summary.json")
-    write_json(slide_metrics_ci, args.output_dir / "slide_metrics_with_ci.json")
+    write_json(
+        {**slide_metrics_ci, "exact_intervals": exact_intervals},
+        args.output_dir / "slide_metrics_with_ci.json",
+    )
     write_json(image_metrics, args.output_dir / "image_metrics_descriptive.json")
     write_csv_dicts(bootstrap_rows, args.output_dir / "bootstrap_distributions.csv")
     write_csv_dicts(subgroup_rows, args.output_dir / "subgroup_statistics.csv", SUBGROUP_COLUMNS)
     write_json(calib, args.output_dir / "calibration_statistics.json")
     write_csv_dicts(confidence_rows, args.output_dir / "confidence_by_slide.csv", CONFIDENCE_BY_SLIDE_COLUMNS)
     write_csv_dicts(error_rows, args.output_dir / "error_analysis_slide_level.csv", ERROR_ANALYSIS_COLUMNS)
+    write_csv_dicts(date_rows, args.output_dir / "subgroup_by_acquisition_date.csv", DATE_SUBGROUP_COLUMNS)
     write_json(domain_shift, args.output_dir / "optional_domain_shift_statistics.json")
 
     print_summary(summary)

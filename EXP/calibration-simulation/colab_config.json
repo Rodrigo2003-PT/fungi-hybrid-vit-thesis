@@ -1,0 +1,104 @@
+{
+  "code_dir": "/content/drive/MyDrive/partAB/code",
+  "drive_root": "/content/drive/MyDrive/partAB",
+  "local_root": "/content/partab_local",
+  "github_mirror": {
+    "root": "/content/drive/MyDrive/colab/lsa_convtok_vit",
+    "commit": "490673ed024fa6cb0dc5686e60362d87d1b216ed",
+    "maps": "GitHub ViT/HybridViT/ -> /content/drive/MyDrive/colab/lsa_convtok_vit/"
+  },
+  "budget_hours": 5.0,
+  "margin_minutes": 20,
+  "optics": {
+    "internal": {
+      "camera": "Photometrics Prime 95B",
+      "sensor_pitch_um": "11.0",
+      "binning": 1,
+      "total_magnification": "63",
+      "n_px": 1200
+    },
+    "external": {
+      "camera": "ZEISS Axiocam 820 mono",
+      "sensor_pitch_um": "2.74",
+      "binning": 2,
+      "total_magnification": "63",
+      "n_px": 2256,
+      "native_n_px": 4512
+    }
+  },
+  "metadata_policy": {
+    "external": "required",
+    "internal": "verify_if_present",
+    "rel_tol": "0.005"
+  },
+  "geometry": {
+    "supplementary_T": [],
+    "expected_opencv": null,
+    "protocol_deviation": null
+  },
+  "stage_inputs": [
+    {
+      "src": "/content/drive/MyDrive/partAB/inputs/internal_fungi.zip",
+      "dst": "/content/data/internal_fungi",
+      "expect": [
+        "Candida albicans",
+        "Candida glabrata"
+      ],
+      "copy_first": true,
+      "optional": false
+    },
+    {
+      "src": "/content/drive/MyDrive/partAB/inputs/external_fungi.zip",
+      "dst": "/content/data/external_fungi",
+      "expect": [
+        "Candida albicans",
+        "Candida glabrata"
+      ],
+      "copy_first": true,
+      "optional": false
+    },
+    {
+      "src": "/content/drive/MyDrive/partAB/inputs/internal_npy.zip",
+      "dst": "/content/data/internal_npy",
+      "expect": [
+        "Candida albicans",
+        "Candida glabrata"
+      ],
+      "copy_first": true,
+      "optional": true
+    }
+  ],
+  "paths": {
+    "split": "/content/drive/MyDrive/colab/conv_ViT/preprocessed/split_indices.json",
+    "internal_raw_root": "/content/data/internal_fungi",
+    "npy_root": "/content/data/internal_npy",
+    "external_manifest": "/content/drive/MyDrive/colab/denseNet121/validation/outputs/manifest/external_manifest.csv",
+    "external_root": "/content/data/external_fungi",
+    "pinned_scripts": "/content/drive/MyDrive/colab/lsa_convtok_vit/validation/scripts",
+    "geometry_spec": "/content/drive/MyDrive/partAB/geometry_spec.json",
+    "densenet_scripts": "/content/drive/MyDrive/colab/denseNet121/validation/scripts",
+    "densenet_ckpt": "/content/drive/MyDrive/colab/denseNet121/validation/models/final_model_standard_cnn.pth",
+    "densenet_checkpoint_identity": "/content/drive/MyDrive/colab/denseNet121/validation/outputs/provenance/checkpoint_identity.json",
+    "densenet_env_lock": "/content/drive/MyDrive/colab/denseNet121/validation/requirements_external.lock",
+    "hybrid_validation_scripts": "/content/drive/MyDrive/colab/lsa_convtok_vit/validation/scripts",
+    "hybrid_source": "/content/drive/MyDrive/colab/lsa_convtok_vit/scripts",
+    "hybrid_ckpt": "/content/drive/MyDrive/colab/lsa_convtok_vit/validation/models/final_model_lsa_convtok.pth",
+    "hybrid_config": "/content/drive/MyDrive/colab/lsa_convtok_vit/validation/configs/external_validation_config.yaml"
+  },
+  "archives": [
+    "hybrid43:E-locked=/content/drive/MyDrive/colab/lsa_convtok_vit/validation/outputs/evaluation/locked_pixel_pipeline",
+    "hybrid43:E-z=/content/drive/MyDrive/colab/lsa_convtok_vit/validation/outputs/evaluation/photometric_mean_std_matched_pipeline",
+    "densenet121:E-locked=/content/drive/MyDrive/colab/denseNet121/validation/outputs/densenet121/locked_pixel_pipeline/evaluation",
+    "densenet121:E-z=/content/drive/MyDrive/colab/denseNet121/validation/outputs/densenet121/photometric_mean_std_matched_pipeline/evaluation"
+  ],
+  "options": {
+    "accept_conditional": true,
+    "holm_scheme": "protocol_m12",
+    "calib_workers": 3,
+    "allow_ungated": false,
+    "allow_unsafe_densenet_load": false
+  },
+  "migration": {
+    "accept_sha256": null
+  }
+}

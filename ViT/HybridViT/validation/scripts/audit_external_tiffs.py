@@ -21,11 +21,27 @@ model inputs:
     - RGB/multichannel, saturated, corrupt, or unexpectedly scaled files would
       compromise the external-validation claim.
 
+Optical calibration (O-4 / O-5)
+-------------------------------
+Each image's header calibration is read from the already-open TIFF (no extra
+file pass) with priority ImageJ ``unit`` + XResolution/YResolution, then
+OME-XML PhysicalSize, then TIFF ResolutionUnit. It is compared with the pixel
+spacing derived from the metadata ``optics`` primitives (optics_provenance.py).
+A disagreement beyond the tolerance or a shape different from
+``optics.external.stored_image_px`` is an audit error. A missing calibration
+tag is a warning and is never counted as a pass.
+
+Status semantics (F-05)
+-----------------------
+``audit_info`` records expected conditions (for example values above 4095 in
+true 14-bit data). ``audit_warnings`` is reserved for anomalies, so the
+``warning`` status remains informative.
+
 Inputs
 ------
     1. external_manifest.csv produced by external_manifest.py.
-    2. Optional external_validation_config.yaml for expected bit-depth and output
-       policies.
+    2. external_validation_metadata.json (schema 2.0, ``optics`` block).
+    3. Optional external_validation_config.yaml for expected bit-depth policy.
 
 Outputs
 -------
@@ -41,13 +57,6 @@ Outputs
     intensity_histograms_raw.png
         Raw-pixel intensity histograms by species.
 
-Usage
------
-    python audit_external_tiffs.py \\
-        --manifest outputs_external/manifest/external_manifest.csv \\
-        --config configs/external_validation_config.yaml \\
-        --output-dir outputs_external/audit
-
 Author: Rodrigo Sá
 Date: 2026
 """
@@ -59,10 +68,9 @@ import csv
 import json
 import math
 import sys
-import warnings
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -82,7 +90,17 @@ except ImportError as exc:
         "Install it with: pip install matplotlib"
     ) from exc
 
+from optics_provenance import (
+    derive_pixel_spacing_um,
+    optics_provenance_record,
+    read_tiff_calibration,
+    relative_error,
+    validate_optics,
+)
+from pipeline_common import resolve_setting
 
+
+AUDIT_SCHEMA_VERSION = "2.0"
 SUPPORTED_TIFF_EXTENSIONS = {".tif", ".tiff", ".TIF", ".TIFF"}
 DEFAULT_EXPECTED_EXTERNAL_BIT_DEPTH = 14
 DEFAULT_EXPECTED_CONTAINER_BIT_DEPTHS = {14, 16}
@@ -124,7 +142,13 @@ PER_IMAGE_COLUMNS = [
     "dynamic_range_fraction_12bit",
     "dynamic_range_fraction_14bit",
     "dynamic_range_fraction_16bit",
+    "header_spacing_x_um",
+    "header_spacing_y_um",
+    "header_spacing_source",
+    "spacing_rel_error",
+    "shape_matches_optics",
     "audit_status",
+    "audit_info",
     "audit_warnings",
     "audit_errors",
 ]
@@ -158,7 +182,7 @@ PER_SLIDE_COLUMNS = [
 ]
 
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Audit external-validation TIFF files before preprocessing and "
@@ -173,12 +197,24 @@ def parse_args() -> argparse.Namespace:
         help="Path to external_manifest.csv produced by external_manifest.py.",
     )
     parser.add_argument(
+        "--metadata",
+        required=True,
+        type=Path,
+        help="external_validation_metadata.json (schema 2.0) providing the optics block.",
+    )
+    parser.add_argument(
         "--config",
         type=Path,
         default=None,
+        help="Optional external_validation_config.yaml (expected bit-depth policy).",
+    )
+    parser.add_argument(
+        "--raw-root",
+        type=Path,
+        default=None,
         help=(
-            "Optional external_validation_config.yaml. Used for expected "
-            "bit-depth and audit policy when PyYAML is available."
+            "Optional dataset root. When given, images are read from raw_root/relative_path "
+            "instead of the absolute manifest image_path (portable re-runs)."
         ),
     )
     parser.add_argument(
@@ -190,9 +226,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expected-effective-bit-depth",
         type=int,
-        default=DEFAULT_EXPECTED_EXTERNAL_BIT_DEPTH,
+        default=None,
         choices=[8, 12, 14, 16],
-        help="Expected effective bit depth of external raw acquisition.",
+        help=(
+            "Expected effective bit depth of external raw acquisition. Precedence: "
+            "this flag > config tiff_audit.expected_external_effective_bit_depth > 14."
+        ),
     )
     parser.add_argument(
         "--histogram-sample-pixels-per-image",
@@ -233,7 +272,11 @@ def parse_args() -> argparse.Namespace:
             "detected."
         ),
     )
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    return build_arg_parser().parse_args(argv)
 
 
 def load_optional_yaml_config(path: Optional[Path]) -> Dict[str, Any]:
@@ -244,12 +287,8 @@ def load_optional_yaml_config(path: Optional[Path]) -> Dict[str, Any]:
 
     try:
         import yaml
-    except ImportError:
-        warnings.warn(
-            "PyYAML is not installed; continuing without YAML config parsing. "
-            "Install with: pip install pyyaml"
-        )
-        return {}
+    except ImportError as exc:
+        raise ImportError("PyYAML is required to read the config. Install with: pip install pyyaml") from exc
 
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
@@ -415,6 +454,7 @@ def get_tiff_page_metadata(image_path: Path) -> Tuple[np.ndarray, Dict[str, Any]
             "container_bit_depth": container_bit_depth,
             "photometric": photometric,
             "samples_per_pixel": samples_per_pixel,
+            "calibration": read_tiff_calibration(tif),
         }
 
     return image, metadata
@@ -426,9 +466,12 @@ def compute_image_statistics(
     expected_effective_bit_depth: int,
     expected_container_bit_depths: Sequence[int],
     high_saturation_warning_threshold: float,
+    optics_expectation: Optional[Dict[str, Any]] = None,
+    raw_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    image_path = Path(manifest_row["image_path"])
+    image_path = resolve_image_path(manifest_row, raw_root)
 
+    audit_info: List[str] = []
     audit_warnings: List[str] = []
     audit_errors: List[str] = []
 
@@ -455,6 +498,15 @@ def compute_image_statistics(
     except Exception as exc:
         audit_errors.append(f"Failed to read TIFF: {exc}")
         return finalize_failed_row(base_row, audit_warnings, audit_errors)
+
+    optics_fields = check_optics_against_image(
+        image_shape=tuple(int(v) for v in squeeze_singleton_channel(image).shape),
+        calibration=tiff_meta.get("calibration", {}),
+        optics_expectation=optics_expectation,
+        audit_warnings=audit_warnings,
+        audit_errors=audit_errors,
+    )
+    base_row.update(optics_fields)
 
     container_bit_depth = tiff_meta.get("container_bit_depth")
     photometric = tiff_meta.get("photometric")
@@ -517,7 +569,6 @@ def compute_image_statistics(
     #   p999 = 99.9th percentile
     # This avoids duplicate lower-tail statistics and keeps the exported schema stable.
 
-    total = float(arr.size)
     zero_fraction = float(np.mean(arr == 0))
     values_above_4095_fraction = float(np.mean(arr > (2**12 - 1)))
     values_above_16383_fraction = float(np.mean(arr > (2**14 - 1)))
@@ -544,7 +595,8 @@ def compute_image_statistics(
         )
 
     if expected_effective_bit_depth == 14 and values_above_4095_fraction > 0:
-        audit_warnings.append(
+        # Expected condition for true 14-bit data: informational, not a warning (F-05).
+        audit_info.append(
             "Pixel values exceed 4095; this is expected for true 14-bit data "
             "and confirms that 12-bit normalization would be inappropriate."
         )
@@ -606,9 +658,78 @@ def compute_image_statistics(
         "dynamic_range_fraction_14bit": dynamic_range_fraction_14bit,
         "dynamic_range_fraction_16bit": dynamic_range_fraction_16bit,
         "audit_status": status,
+        "audit_info": " | ".join(audit_info),
         "audit_warnings": " | ".join(audit_warnings),
         "audit_errors": " | ".join(audit_errors),
     }
+
+
+def resolve_image_path(manifest_row: Dict[str, str], raw_root: Optional[Path]) -> Path:
+    """raw_root/relative_path when --raw-root is given, else the manifest image_path."""
+    if raw_root is not None:
+        return Path(raw_root) / Path(manifest_row["relative_path"])
+    return Path(manifest_row["image_path"])
+
+
+def build_optics_expectation(optics: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Derive the per-image expectation (spacing, stored shape, tolerance) from the
+    metadata optics block. Returns (expectation_or_None, provenance_record).
+    """
+    record = optics_provenance_record(optics)
+    validation, domains = validate_optics(optics)
+    ext = domains.get("external")
+    if ext is None:
+        return None, record
+    return {
+        "pixel_spacing_um": derive_pixel_spacing_um(ext),
+        "stored_image_px": tuple(ext.stored_image_px),
+        "spacing_rel_tolerance": float(validation.checks.get("spacing_rel_tolerance")),
+    }, record
+
+
+def check_optics_against_image(
+    *,
+    image_shape: Tuple[int, ...],
+    calibration: Dict[str, Any],
+    optics_expectation: Optional[Dict[str, Any]],
+    audit_warnings: List[str],
+    audit_errors: List[str],
+) -> Dict[str, Any]:
+    """Apply O-4 (header calibration) and O-5 (shape) to one image."""
+    out: Dict[str, Any] = {
+        "header_spacing_x_um": calibration.get("x_um"),
+        "header_spacing_y_um": calibration.get("y_um"),
+        "header_spacing_source": calibration.get("source", "calibration_tag_absent"),
+        "spacing_rel_error": "",
+        "shape_matches_optics": "",
+    }
+    if optics_expectation is None:
+        audit_warnings.append("Optics expectation unavailable; O-4/O-5 not evaluated.")
+        return out
+
+    expected_shape = tuple(optics_expectation["stored_image_px"])
+    shape_ok = tuple(image_shape) == expected_shape
+    out["shape_matches_optics"] = bool(shape_ok)
+    if not shape_ok:
+        audit_errors.append(f"O-5: image shape {tuple(image_shape)} != optics stored_image_px {expected_shape}.")
+
+    x_um, y_um = calibration.get("x_um"), calibration.get("y_um")
+    if x_um is None or y_um is None:
+        audit_warnings.append("O-4: calibration_tag_absent (no ImageJ/OME/TIFF pixel calibration found).")
+        return out
+
+    expected = float(optics_expectation["pixel_spacing_um"])
+    rel = max(relative_error(x_um, expected), relative_error(y_um, expected))
+    out["spacing_rel_error"] = rel
+    if rel > float(optics_expectation["spacing_rel_tolerance"]):
+        audit_errors.append(
+            f"O-4: header spacing ({x_um:.8g}, {y_um:.8g}) µm/px from {calibration.get('source')} "
+            f"disagrees with derived {expected:.8g} µm/px (relative error {rel:.4%})."
+        )
+    if relative_error(x_um, y_um) > float(optics_expectation["spacing_rel_tolerance"]):
+        audit_warnings.append(f"O-4: anisotropic calibration x={x_um:.8g}, y={y_um:.8g} µm/px.")
+    return out
 
 
 def finalize_failed_row(
@@ -735,6 +856,8 @@ def summarize_audit(
     manifest_path: Path,
     config_path: Optional[Path],
     expected_effective_bit_depth: int,
+    optics_record: Optional[Dict[str, Any]] = None,
+    settings_resolution: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     image_status_counts = Counter(str(r.get("audit_status", "")) for r in per_image_rows)
     slide_status_counts = Counter(str(r.get("audit_status", "")) for r in per_slide_rows)
@@ -767,6 +890,26 @@ def summarize_audit(
 
     if failed_images:
         errors.append(f"{len(failed_images)} images failed TIFF audit.")
+
+    def _is_true(v: Any) -> bool:
+        return v is True or str(v) == "True"
+
+    optics_checks = {
+        "n_shape_matches_optics": sum(1 for r in per_image_rows if _is_true(r.get("shape_matches_optics"))),
+        "n_shape_mismatch": sum(1 for r in per_image_rows if r.get("shape_matches_optics") is False or str(r.get("shape_matches_optics")) == "False"),
+        "header_spacing_source_counts": dict(sorted(Counter(str(r.get("header_spacing_source", "")) for r in per_image_rows).items())),
+        "n_calibration_tag_absent": sum(1 for r in per_image_rows if str(r.get("header_spacing_source", "")) == "calibration_tag_absent"),
+        "max_spacing_rel_error": max(
+            [float(r["spacing_rel_error"]) for r in per_image_rows if r.get("spacing_rel_error") not in ("", None)],
+            default=None,
+        ),
+    }
+    if optics_checks["n_calibration_tag_absent"]:
+        warnings_list.append(f"{optics_checks['n_calibration_tag_absent']} images have no pixel calibration tag (O-4).")
+    info_counts = Counter()
+    for r in per_image_rows:
+        for msg in [m for m in str(r.get("audit_info", "")).split(" | ") if m]:
+            info_counts[msg] += 1
 
     bit_depth_counts = Counter(
         str(r.get("inferred_effective_bit_depth", ""))
@@ -807,6 +950,7 @@ def summarize_audit(
     mean_sat14 = float(np.mean(sat14)) if sat14.size else None
 
     summary = {
+        "schema_version": AUDIT_SCHEMA_VERSION,
         "validation_status": "failed" if errors else "passed_with_warnings" if warning_images or warnings_list else "passed",
         "manifest_path": str(manifest_path),
         "config_path": str(config_path) if config_path else None,
@@ -823,6 +967,11 @@ def summarize_audit(
         "mean_values_above_4095_fraction": mean_values_above_4095,
         "mean_values_above_16383_fraction": mean_values_above_16383,
         "mean_saturation_fraction_14bit": mean_sat14,
+        "optics_checks": optics_checks,
+        "optics_sha256": (optics_record or {}).get("optics_sha256"),
+        "optics_provenance_gaps": (optics_record or {}).get("provenance_gaps", []),
+        "info_counts": dict(sorted(info_counts.items())),
+        "settings_resolution": settings_resolution or {},
         "errors": errors,
         "warnings": warnings_list,
         "failed_images": failed_images,
@@ -837,6 +986,10 @@ def summarize_audit(
             "values_above_16383": (
                 "Values above 16383 are unexpected for true 14-bit raw data and "
                 "should be investigated before final preprocessing."
+            ),
+            "audit_info": (
+                "Expected conditions are recorded in audit_info and do not change the "
+                "image status; audit_warnings is reserved for anomalies."
             ),
             "slide_level_unit": (
                 "This TIFF audit is image-level for quality control, but model "
@@ -962,6 +1115,9 @@ def print_summary(summary: Dict[str, Any], output_dir: Path) -> None:
     print(f"  - values > 4095   : {summary['mean_values_above_4095_fraction']}")
     print(f"  - values > 16383  : {summary['mean_values_above_16383_fraction']}")
     print(f"  - 14-bit saturation: {summary['mean_saturation_fraction_14bit']}")
+    print("\nOptics checks (O-4/O-5):")
+    for k, v in summary.get("optics_checks", {}).items():
+        print(f"  - {k}: {v}")
     if summary["errors"]:
         print("\nErrors:")
         for e in summary["errors"]:
@@ -977,21 +1133,40 @@ def main() -> None:
     args = parse_args()
 
     config = load_optional_yaml_config(args.config)
+    settings_resolution: Dict[str, Any] = {}
     expected_effective_bit_depth = int(
-        get_nested(
+        resolve_setting(
+            "expected_effective_bit_depth",
+            args.expected_effective_bit_depth,
             config,
             ["tiff_audit", "expected_external_effective_bit_depth"],
-            args.expected_effective_bit_depth,
+            DEFAULT_EXPECTED_EXTERNAL_BIT_DEPTH,
+            settings_resolution,
         )
     )
-    expected_container_bit_depths = get_nested(
-        config,
-        ["tiff_audit", "expected_container_bit_depths"],
-        list(DEFAULT_EXPECTED_CONTAINER_BIT_DEPTHS),
-    )
-    if expected_container_bit_depths is None:
-        expected_container_bit_depths = list(DEFAULT_EXPECTED_CONTAINER_BIT_DEPTHS)
-    expected_container_bit_depths = [int(v) for v in expected_container_bit_depths]
+    expected_container_bit_depths = [
+        int(v)
+        for v in resolve_setting(
+            "expected_container_bit_depths",
+            None,
+            config,
+            ["tiff_audit", "expected_container_bit_depths"],
+            sorted(DEFAULT_EXPECTED_CONTAINER_BIT_DEPTHS),
+            settings_resolution,
+        )
+    ]
+
+    with args.metadata.open("r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    optics = metadata.get("optics") if isinstance(metadata, dict) else None
+    if not isinstance(optics, dict):
+        raise ValueError(f"Metadata {args.metadata} has no 'optics' block (schema 2.0 required).")
+    optics_expectation, optics_record = build_optics_expectation(optics)
+    if optics_expectation is None and args.strict:
+        raise ValueError(
+            "Optics block could not be parsed; O-4/O-5 cannot be evaluated: "
+            f"{optics_record['validation']['errors']}"
+        )
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1005,6 +1180,8 @@ def main() -> None:
             expected_effective_bit_depth=expected_effective_bit_depth,
             expected_container_bit_depths=expected_container_bit_depths,
             high_saturation_warning_threshold=args.high_saturation_warning_threshold,
+            optics_expectation=optics_expectation,
+            raw_root=args.raw_root,
         )
         per_image_rows.append(row)
 
@@ -1027,6 +1204,8 @@ def main() -> None:
         manifest_path=args.manifest,
         config_path=args.config,
         expected_effective_bit_depth=expected_effective_bit_depth,
+        optics_record=optics_record,
+        settings_resolution=settings_resolution,
     )
     summary["outputs"] = {
         "per_image_csv": str(per_image_csv),

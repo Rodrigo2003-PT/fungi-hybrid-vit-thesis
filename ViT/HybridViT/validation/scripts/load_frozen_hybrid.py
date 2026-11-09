@@ -7,59 +7,39 @@ Safe loader for the frozen LSA-ConvTok Hybrid model used in external validation.
 Scientific role
 ---------------
 External validation must evaluate the exact frozen Hybrid model selected after
-model development. This script centralizes checkpoint loading so that downstream
-evaluation and explainability scripts do not accidentally:
+model development. This module centralises checkpoint loading so that
+downstream evaluation scripts cannot:
     - instantiate the wrong architecture,
     - load mismatched weights,
-    - ignore architecture-hash mismatches,
-    - use the full training-resume checkpoint as the default inference artifact,
+    - report an architecture check that did not actually happen,
+    - fall back silently to hard-coded normalisation statistics,
     - leave gradients enabled during external inference.
+
+Architecture identity (F-01)
+----------------------------
+``training_logic.validate_checkpoint_arch`` returns True with only a warning
+when a checkpoint has no ``arch_metadata``. This loader therefore establishes
+identity itself, in priority order:
+
+    1. stored_arch_metadata             checkpoint arch_metadata.arch_hash
+    2. recomputed_from_embedded_config  training_logic.compute_arch_hash(config)
+    3. provenance_arch_metadata         provenance checkpoint arch_metadata.arch_hash
+
+Every available hash must equal the expected hash; any mismatch is fatal in
+strict mode. ``architecture_hash_validated`` is the computed outcome, never a
+constant. Strict ``load_state_dict`` additionally verifies keys and shapes.
+
+Normalisation statistics (F-03)
+-------------------------------
+Mean/std are located by explicit key search and the source key is recorded.
+A fallback to the built-in defaults is an error in strict mode. Values are
+compared with the config's expected values and, when supplied, with the
+provenance checkpoint.
 
 Primary checkpoint policy
 -------------------------
-Use:
-    final_model_lsa_convtok.pth
-
-as the primary frozen inference artifact.
-
-Optionally provide:
-    final_model_checkpoint.pth
-
-as the full training-resume provenance checkpoint. When supplied, this script can
-verify that both checkpoints contain equivalent model_state_dict tensors.
-
-Expected model
---------------
-    SimpleViT_LSA_ConvTok
-    experiment_name: lsa_convtok
-    architecture_hash: 95ace50634b621d7
-    image_size: 384
-    channels: 1
-    num_classes: 2
-
-Usage as a module
------------------
-    from load_frozen_hybrid import load_frozen_hybrid
-
-    bundle = load_frozen_hybrid(
-        checkpoint_path="final_model_lsa_convtok.pth",
-        provenance_checkpoint_path="final_model_checkpoint.pth",
-        config_path="configs/external_validation_config.yaml",
-        device="cuda",
-    )
-
-    model = bundle["model"]
-    mean = bundle["mean"]
-    std = bundle["std"]
-
-Usage as a CLI smoke test
--------------------------
-    python load_frozen_hybrid.py \\
-        --checkpoint final_model_lsa_convtok.pth \\
-        --provenance-checkpoint final_model_checkpoint.pth \\
-        --config configs/external_validation_config.yaml \\
-        --device cpu \\
-        --smoke-test
+    final_model_lsa_convtok.pth  primary frozen inference artifact
+    final_model_checkpoint.pth   optional training-resume provenance artifact
 
 Author: Rodrigo Sá
 Date: 2026
@@ -71,17 +51,18 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-
+LOADER_SCHEMA_VERSION = "2.0"
 DEFAULT_EXPECTED_ARCH_HASH = "95ace50634b621d7"
 DEFAULT_MODEL_VARIANT = "SimpleViT_LSA_ConvTok"
 DEFAULT_EXPERIMENT_NAME = "lsa_convtok"
@@ -90,121 +71,99 @@ DEFAULT_CHANNELS = 1
 DEFAULT_NUM_CLASSES = 2
 DEFAULT_MEAN = [0.23691008985042572]
 DEFAULT_STD = [0.007409718818962574]
+MEAN_STD_REL_TOLERANCE = 1e-6
+
+MEAN_KEY_PATHS: Tuple[Tuple[str, ...], ...] = (("mean",), ("metadata", "mean"), ("config", "mean"))
+STD_KEY_PATHS: Tuple[Tuple[str, ...], ...] = (("std",), ("metadata", "std"), ("config", "std"))
 
 
 # -----------------------------------------------------------------------------
-# Optional local imports
+# training_logic import (F-23)
 # -----------------------------------------------------------------------------
+
+def _training_logic_candidates() -> List[Path]:
+    """Import roots in priority order: explicit env dir first, cwd/source last."""
+    script_dir = Path(__file__).resolve().parent
+    env_dir = os.environ.get("EXTERNAL_VALIDATION_SOURCE_CODE_DIR")
+    raw = [
+        Path(env_dir) if env_dir else None,
+        script_dir.parent / "source",
+        script_dir,
+        script_dir.parent,
+        Path.cwd() / "source",
+        Path.cwd(),
+    ]
+    out: List[Path] = []
+    for c in raw:
+        if c is None:
+            continue
+        c = c.resolve()
+        if c.exists() and c not in out:
+            out.append(c)
+    return out
+
 
 def _import_training_factory():
     """
-    Import training/model factory functions lazily.
+    Import ``build_model``, ``validate_checkpoint_arch`` and ``compute_arch_hash``
+    from training_logic.py.
 
-    Robustness for the validation layout:
-        validation/scripts/load_frozen_hybrid.py
-        validation/source/training_logic.py
-
-    The runner sets PYTHONPATH and EXTERNAL_VALIDATION_SOURCE_CODE_DIR, but this
-    function also searches common locations so direct CLI usage remains safe.
+    The candidate roots are placed at the front of ``sys.path`` in priority
+    order (moving them if already present), so EXTERNAL_VALIDATION_SOURCE_CODE_DIR
+    always wins over a stray training_logic.py in the working directory.
     """
     import importlib
-    import os
 
-    script_dir = Path(__file__).resolve().parent
-    candidates = [
-        Path(os.environ["EXTERNAL_VALIDATION_SOURCE_CODE_DIR"])
-        if os.environ.get("EXTERNAL_VALIDATION_SOURCE_CODE_DIR") else None,
-        script_dir,
-        script_dir.parent / "source",
-        script_dir.parent,
-        Path.cwd(),
-        Path.cwd() / "source",
-    ]
-
-    seen = set()
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        candidate = candidate.resolve()
-        if not candidate.exists() or str(candidate) in seen:
-            continue
-        seen.add(str(candidate))
-        if str(candidate) not in sys.path:
-            sys.path.insert(0, str(candidate))
-
+    module = sys.modules.get("training_logic")
+    candidates = _training_logic_candidates()
+    if module is None:
+        ordered = [str(c) for c in candidates]
+        sys.path[:] = ordered + [p for p in sys.path if p not in ordered]
+        try:
+            module = importlib.import_module("training_logic")
+        except Exception as exc:
+            raise ImportError(
+                "Could not import training_logic.py. Expected it in validation/source or in "
+                f"EXTERNAL_VALIDATION_SOURCE_CODE_DIR. Checked import roots: {ordered}."
+            ) from exc
     try:
-        module = importlib.import_module("training_logic")
         build_model = getattr(module, "build_model")
         validate_checkpoint_arch = getattr(module, "validate_checkpoint_arch")
         compute_arch_hash = getattr(module, "compute_arch_hash")
-    except Exception as exc:
-        checked = [str(c.resolve()) for c in candidates if c is not None and c.exists()]
-        raise ImportError(
-            "Could not import build_model/validate_checkpoint_arch from training_logic.py. "
-            "Expected training_logic.py in validation/source or in --source-code-dir. "
-            f"Checked import roots: {checked}. Current sys.path head: {sys.path[:8]}"
-        ) from exc
-
+    except AttributeError as exc:
+        raise ImportError(f"training_logic at {getattr(module, '__file__', '?')} lacks a required function.") from exc
     return build_model, validate_checkpoint_arch, compute_arch_hash
+
+
+def training_logic_file() -> Optional[str]:
+    module = sys.modules.get("training_logic")
+    return str(Path(module.__file__).resolve()) if module is not None and getattr(module, "__file__", None) else None
 
 
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Safely load the frozen final LSA-ConvTok Hybrid checkpoint for "
-            "external validation."
-        ),
+        description="Safely load the frozen final LSA-ConvTok Hybrid checkpoint for external validation.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--checkpoint",
-        required=True,
-        type=Path,
-        help="Primary inference checkpoint, expected final_model_lsa_convtok.pth.",
-    )
-    parser.add_argument(
-        "--provenance-checkpoint",
-        type=Path,
-        default=None,
-        help=(
-            "Optional full training-resume checkpoint, expected "
-            "final_model_checkpoint.pth. Used only for provenance/equivalence checks."
-        ),
-    )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=None,
-        help="Optional external_validation_config.yaml.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help="Device: 'auto', 'cpu', 'cuda', or a valid torch device string.",
-    )
-    parser.add_argument(
-        "--strict",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Abort on architecture/config/provenance inconsistencies.",
-    )
-    parser.add_argument(
-        "--smoke-test",
-        action="store_true",
-        help="Run a no-gradient dummy forward pass after loading.",
-    )
-    parser.add_argument(
-        "--metadata-output",
-        type=Path,
-        default=None,
-        help="Optional path to write loader metadata JSON.",
-    )
-    return parser.parse_args()
+    parser.add_argument("--checkpoint", required=True, type=Path,
+                        help="Primary inference checkpoint, expected final_model_lsa_convtok.pth.")
+    parser.add_argument("--provenance-checkpoint", type=Path, default=None,
+                        help="Optional full training-resume checkpoint used only for provenance checks.")
+    parser.add_argument("--config", type=Path, default=None, help="Optional external_validation_config.yaml.")
+    parser.add_argument("--device", type=str, default="auto", help="'auto', 'cpu', 'cuda', or a torch device.")
+    parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=True,
+                        help="Abort on architecture/config/provenance inconsistencies.")
+    parser.add_argument("--smoke-test", action="store_true", help="Run a no-gradient dummy forward pass.")
+    parser.add_argument("--metadata-output", type=Path, default=None, help="Optional loader metadata JSON path.")
+    return parser
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    return build_arg_parser().parse_args(argv)
 
 
 # -----------------------------------------------------------------------------
@@ -214,21 +173,15 @@ def parse_args() -> argparse.Namespace:
 def load_optional_yaml_config(path: Optional[Path]) -> Dict[str, Any]:
     if path is None:
         return {}
+    path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Config YAML not found: {path}")
-
     try:
         import yaml
-    except ImportError:
-        warnings.warn(
-            "PyYAML is not installed; continuing without YAML config parsing. "
-            "Install with: pip install pyyaml"
-        )
-        return {}
-
+    except ImportError as exc:
+        raise ImportError("PyYAML is required to read the config. Install with: pip install pyyaml") from exc
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
-
     return data if isinstance(data, dict) else {}
 
 
@@ -243,7 +196,7 @@ def get_nested(data: Dict[str, Any], keys: Sequence[str], default: Any = None) -
 
 def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
-    with path.open("rb") as f:
+    with Path(path).open("rb") as f:
         while True:
             block = f.read(block_size)
             if not block:
@@ -255,34 +208,24 @@ def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
 def resolve_device(device: Union[str, torch.device]) -> torch.device:
     if isinstance(device, torch.device):
         return device
-
     device_str = str(device).lower()
     if device_str == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     if device_str.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false.")
-
     return torch.device(device)
 
 
-def normalize_list(value: Any, default: Sequence[float]) -> List[float]:
-    if value is None:
-        return [float(v) for v in default]
+def normalize_list(value: Any) -> List[float]:
     if isinstance(value, torch.Tensor):
-        value = value.detach().cpu().tolist()
-    if isinstance(value, np.ndarray):
-        value = value.tolist()
-    if isinstance(value, (int, float)):
+        value = value.detach().cpu().reshape(-1).tolist()
+    elif isinstance(value, np.ndarray):
+        value = value.reshape(-1).tolist()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
         return [float(value)]
     if isinstance(value, (list, tuple)):
         return [float(v) for v in value]
     raise ValueError(f"Cannot convert value to list of floats: {value!r}")
-
-
-def tensor_sha256(tensor: torch.Tensor) -> str:
-    arr = tensor.detach().cpu().contiguous().numpy()
-    return hashlib.sha256(arr.tobytes()).hexdigest()
 
 
 def hash_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> str:
@@ -291,10 +234,7 @@ def hash_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> str:
 
 
 def state_dict_content_fingerprint(state_dict: Dict[str, torch.Tensor]) -> str:
-    """
-    Compute a deterministic fingerprint over state_dict keys, shapes, dtypes, and
-    tensor contents. This is useful for provenance comparison, not for security.
-    """
+    """Deterministic fingerprint over keys, shapes, dtypes and tensor bytes (provenance only)."""
     h = hashlib.sha256()
     for key in sorted(state_dict.keys()):
         tensor = state_dict[key]
@@ -307,104 +247,88 @@ def state_dict_content_fingerprint(state_dict: Dict[str, torch.Tensor]) -> str:
     return h.hexdigest()
 
 
-def max_abs_state_dict_difference(
-    state_a: Dict[str, torch.Tensor],
-    state_b: Dict[str, torch.Tensor],
-) -> Optional[float]:
-    keys_a = set(state_a.keys())
-    keys_b = set(state_b.keys())
-    if keys_a != keys_b:
+def max_abs_state_dict_difference(state_a: Dict[str, torch.Tensor], state_b: Dict[str, torch.Tensor]) -> Optional[float]:
+    if set(state_a.keys()) != set(state_b.keys()):
         return None
-
     max_diff = 0.0
-    for key in sorted(keys_a):
-        a = state_a[key]
-        b = state_b[key]
+    for key in sorted(state_a.keys()):
+        a, b = state_a[key], state_b[key]
         if not torch.is_tensor(a) or not torch.is_tensor(b):
             continue
         if a.shape != b.shape:
             return None
-        diff = (a.detach().cpu().float() - b.detach().cpu().float()).abs().max().item()
-        max_diff = max(max_diff, float(diff))
+        max_diff = max(max_diff, float((a.detach().cpu().float() - b.detach().cpu().float()).abs().max().item()))
     return max_diff
+
+
+def _lookup(data: Dict[str, Any], path: Sequence[str]) -> Any:
+    cur: Any = data
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    return cur
 
 
 # -----------------------------------------------------------------------------
 # Checkpoint parsing
 # -----------------------------------------------------------------------------
 
-def torch_load_checkpoint(path: Union[str, Path]) -> Dict[str, Any]:
+def torch_load_checkpoint(path: Union[str, Path]) -> Tuple[Dict[str, Any], str]:
+    """
+    Load a checkpoint dict. ``weights_only=True`` is attempted first; only when
+    the file requires arbitrary unpickling is ``weights_only=False`` used, and
+    that is recorded as ``unsafe_pickle_trusted_artifact`` (F-22).
+    """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
-    ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
+    try:
+        ckpt = torch.load(str(path), map_location="cpu", weights_only=True)
+        mode = "weights_only"
+    except Exception:
+        ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
+        mode = "unsafe_pickle_trusted_artifact"
     if not isinstance(ckpt, dict):
         raise ValueError(f"Checkpoint must be a dictionary, got {type(ckpt)} from {path}")
-    return ckpt
+    return ckpt, mode
 
 
 def extract_arch_metadata(checkpoint: Dict[str, Any]) -> Dict[str, Any]:
-    arch = checkpoint.get("arch_metadata")
-    if isinstance(arch, dict):
-        return arch
-
-    metadata = checkpoint.get("metadata")
-    if isinstance(metadata, dict):
-        arch = metadata.get("arch_metadata")
-        if isinstance(arch, dict):
-            return arch
-
-    architecture = checkpoint.get("architecture")
-    if isinstance(architecture, dict):
-        arch = architecture.get("arch_metadata")
-        if isinstance(arch, dict):
-            return arch
-
+    for path in (("arch_metadata",), ("metadata", "arch_metadata"), ("architecture", "arch_metadata")):
+        value = _lookup(checkpoint, path)
+        if isinstance(value, dict):
+            return value
     return {}
 
 
-def extract_config(checkpoint: Dict[str, Any], arch_metadata: Dict[str, Any]) -> Dict[str, Any]:
+def extract_config(checkpoint: Dict[str, Any], arch_metadata: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
     """
-    Extract a model-building configuration.
+    Return (model-building config, config_source).
 
-    Preferred:
-        checkpoint["config"]
-
-    Fallback:
-        reconstruct the minimum required config from arch_metadata.
-
-    This fallback is included for robustness but the primary final_model_lsa_convtok.pth
-    should contain a full config.
+    config_source is ``embedded_config``, ``embedded_metadata_config`` or
+    ``reconstructed_from_arch_metadata``. Reconstruction is a robustness
+    fallback; it is recorded so reports can state it.
     """
     config = checkpoint.get("config")
     if isinstance(config, dict) and config:
-        return dict(config)
-
+        return dict(config), "embedded_config"
     metadata = checkpoint.get("metadata")
-    if isinstance(metadata, dict):
-        config = metadata.get("config")
-        if isinstance(config, dict) and config:
-            return dict(config)
-
-    # Fallback reconstruction from arch_metadata. This must match build_model()
-    # expectations in training_logic.py for SimpleViT_LSA_ConvTok.
+    if isinstance(metadata, dict) and isinstance(metadata.get("config"), dict) and metadata["config"]:
+        return dict(metadata["config"]), "embedded_metadata_config"
     if not arch_metadata:
         raise ValueError(
             "Checkpoint lacks both full config and architecture metadata. "
             "Cannot safely reconstruct the frozen Hybrid model."
         )
-
-    exp = arch_metadata.get("experiment_name", DEFAULT_EXPERIMENT_NAME)
-
+    bit_depth = checkpoint.get("bit_depth")
+    if bit_depth is None and isinstance(metadata, dict):
+        bit_depth = metadata.get("bit_depth")
     reconstructed = {
-        "experiment_name": exp,
+        "experiment_name": arch_metadata.get("experiment_name", DEFAULT_EXPERIMENT_NAME),
         "image_size": int(arch_metadata.get("image_size", DEFAULT_IMAGE_SIZE)),
         "channels": int(arch_metadata.get("channels", DEFAULT_CHANNELS)),
-        "bit_depth": int(
-            checkpoint.get("bit_depth")
-            or (metadata.get("bit_depth") if isinstance(metadata, dict) else 12)
-            or 12
-        ),
+        "bit_depth": int(bit_depth) if bit_depth is not None else 12,
         "model_config": {
             "dim": int(arch_metadata.get("dim", 256)),
             "depth": int(arch_metadata.get("depth", 8)),
@@ -413,13 +337,7 @@ def extract_config(checkpoint: Dict[str, Any], arch_metadata: Dict[str, Any]) ->
             "dim_head": int(arch_metadata.get("dim_head", 64)),
             "pe_temperature": int(arch_metadata.get("pe_temperature", 10000)),
         },
-        "convtok_blocks": arch_metadata.get(
-            "convtok_blocks",
-            [
-                {"conv_k": 7, "conv_s": 2, "conv_p": 3, "pool_k": 3, "pool_s": 2, "pool_p": 1},
-                {"conv_k": 3, "conv_s": 2, "conv_p": 1, "pool_k": 3, "pool_s": 2, "pool_p": 1},
-            ],
-        ),
+        "convtok_blocks": arch_metadata.get("convtok_blocks"),
         "convtok_hidden_channels": int(arch_metadata.get("convtok_hidden_channels", 64)),
         "convtok_match_baseline_tokens": True,
         "convtok_expected_hw": arch_metadata.get("convtok_expected_hw", [24, 24]),
@@ -428,50 +346,67 @@ def extract_config(checkpoint: Dict[str, Any], arch_metadata: Dict[str, Any]) ->
         "convtok_conv_bias": bool(arch_metadata.get("convtok_conv_bias", False)),
         "init_policy": arch_metadata.get("init_policy", "default"),
     }
-
-    return reconstructed
+    return reconstructed, "reconstructed_from_arch_metadata"
 
 
 def extract_model_state_dict(checkpoint: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-    state = checkpoint.get("model_state_dict")
-    if isinstance(state, dict):
-        return state
-
-    # Some exports may use "state_dict".
-    state = checkpoint.get("state_dict")
-    if isinstance(state, dict):
-        return state
-
+    for key in ("model_state_dict", "state_dict"):
+        state = checkpoint.get(key)
+        if isinstance(state, dict):
+            return state
     raise ValueError("Checkpoint has no model_state_dict/state_dict.")
 
 
-def extract_mean_std(checkpoint: Dict[str, Any], config: Dict[str, Any]) -> Tuple[List[float], List[float]]:
-    metadata = checkpoint.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
+def resolve_normalization_stats(checkpoint: Dict[str, Any]) -> Tuple[Optional[List[float]], Optional[List[float]], str]:
+    """
+    Locate checkpoint mean/std by explicit key search (``is None`` tests, no
+    truthiness). Returns (mean, std, source); source is ``"<path>"`` of the
+    first key holding both values, or ``"absent"``.
+    """
+    for m_path, s_path in zip(MEAN_KEY_PATHS, STD_KEY_PATHS):
+        m, s = _lookup(checkpoint, m_path), _lookup(checkpoint, s_path)
+        if m is not None and s is not None:
+            return normalize_list(m), normalize_list(s), ".".join(m_path) + "/" + ".".join(s_path)
+    return None, None, "absent"
 
-    mean = (
-        checkpoint.get("mean")
-        or metadata.get("mean")
-        or config.get("mean")
-        or DEFAULT_MEAN
-    )
-    std = (
-        checkpoint.get("std")
-        or metadata.get("std")
-        or config.get("std")
-        or DEFAULT_STD
-    )
 
-    mean_list = normalize_list(mean, DEFAULT_MEAN)
-    std_list = normalize_list(std, DEFAULT_STD)
+def resolve_mean_std(
+    checkpoint: Dict[str, Any],
+    *,
+    expected_mean: Optional[Sequence[float]],
+    expected_std: Optional[Sequence[float]],
+    strict: bool,
+) -> Tuple[List[float], List[float], Dict[str, Any]]:
+    """Resolve mean/std with source tracking and consistency checks (F-03)."""
+    mean, std, source = resolve_normalization_stats(checkpoint)
+    info: Dict[str, Any] = {"mean_std_source": source}
+    if mean is None or std is None:
+        if strict:
+            raise RuntimeError(
+                "Checkpoint mean/std not found under keys mean/std, metadata.mean/std or config.mean/std. "
+                "Refusing mean/std fallback to built-in defaults in strict mode."
+            )
+        warnings.warn("Checkpoint mean/std absent; using built-in defaults (non-strict run).")
+        mean, std = list(DEFAULT_MEAN), list(DEFAULT_STD)
+        info["mean_std_source"] = "built_in_default"
+    if len(mean) != len(std):
+        raise ValueError(f"Mean/std length mismatch: mean={mean}, std={std}")
+    if any((not math.isfinite(s)) or s <= 0 for s in std):
+        raise ValueError(f"All std values must be finite and positive, got {std}")
 
-    if len(mean_list) != len(std_list):
-        raise ValueError(f"Mean/std length mismatch: mean={mean_list}, std={std_list}")
-    if any(s <= 0 for s in std_list):
-        raise ValueError(f"All std values must be positive, got {std_list}")
-
-    return mean_list, std_list
+    matches = None
+    if expected_mean is not None and expected_std is not None:
+        exp_m, exp_s = normalize_list(expected_mean), normalize_list(expected_std)
+        matches = len(exp_m) == len(mean) and len(exp_s) == len(std) and all(
+            abs(a - b) <= MEAN_STD_REL_TOLERANCE * max(abs(b), 1e-12) for a, b in zip(mean + std, exp_m + exp_s)
+        )
+        if not matches:
+            msg = f"Checkpoint mean/std {mean}/{std} differ from config expected {exp_m}/{exp_s}."
+            if strict:
+                raise RuntimeError(msg)
+            warnings.warn(msg)
+    info["mean_std_matches_config"] = matches
+    return [float(v) for v in mean], [float(v) for v in std], info
 
 
 def checkpoint_summary(
@@ -484,53 +419,30 @@ def checkpoint_summary(
     std: Sequence[float],
 ) -> Dict[str, Any]:
     path = Path(path)
+    metadata = checkpoint.get("metadata") if isinstance(checkpoint.get("metadata"), dict) else {}
 
-    metadata = checkpoint.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
+    def first(*values: Any) -> Any:
+        for v in values:
+            if v is not None:
+                return v
+        return None
 
-    architecture_hash = (
-        arch_metadata.get("arch_hash")
-        or checkpoint.get("architecture_hash")
-        or metadata.get("architecture_hash")
-        or metadata.get("arch_hash")
-        or "unknown"
-    )
-
-    model_variant = (
-        checkpoint.get("model_variant")
-        or metadata.get("model_variant")
-        or arch_metadata.get("model_class")
-        or DEFAULT_MODEL_VARIANT
-    )
-
-    image_size = (
-        config.get("image_size")
-        or arch_metadata.get("image_size")
-        or checkpoint.get("image_size")
-        or metadata.get("image_size")
-    )
-
-    channels = (
-        config.get("channels")
-        or arch_metadata.get("channels")
-        or checkpoint.get("channels")
-        or metadata.get("channels")
-    )
-
+    stored_hash = first(arch_metadata.get("arch_hash"), checkpoint.get("architecture_hash"),
+                        metadata.get("architecture_hash"), metadata.get("arch_hash"))
+    image_size = first(config.get("image_size"), arch_metadata.get("image_size"),
+                       checkpoint.get("image_size"), metadata.get("image_size"))
+    channels = first(config.get("channels"), arch_metadata.get("channels"),
+                     checkpoint.get("channels"), metadata.get("channels"))
     return {
         "path": str(path),
         "file_sha256": sha256_file(path),
-        "model_variant": model_variant,
-        "experiment_name": config.get("experiment_name", arch_metadata.get("experiment_name", "unknown")),
-        "architecture_hash": architecture_hash,
+        "model_variant": first(checkpoint.get("model_variant"), metadata.get("model_variant"),
+                               arch_metadata.get("model_class")),
+        "experiment_name": first(config.get("experiment_name"), arch_metadata.get("experiment_name")),
+        "stored_architecture_hash": stored_hash,
         "image_size": int(image_size) if image_size is not None else None,
         "channels": int(channels) if channels is not None else None,
-        "checkpoint_training_bit_depth": (
-            config.get("bit_depth")
-            or checkpoint.get("bit_depth")
-            or metadata.get("bit_depth")
-        ),
+        "checkpoint_training_bit_depth": first(config.get("bit_depth"), checkpoint.get("bit_depth"), metadata.get("bit_depth")),
         "mean": [float(v) for v in mean],
         "std": [float(v) for v in std],
         "state_dict_n_tensors": len(state_dict),
@@ -548,7 +460,6 @@ def expected_values_from_config(config_yaml: Dict[str, Any]) -> Dict[str, Any]:
     expected_model = get_nested(config_yaml, ["checkpoints", "expected_model"], {}) or {}
     if not isinstance(expected_model, dict):
         expected_model = {}
-
     return {
         "architecture_hash": expected_model.get("architecture_hash", DEFAULT_EXPECTED_ARCH_HASH),
         "model_variant": expected_model.get("model_variant", DEFAULT_MODEL_VARIANT),
@@ -556,17 +467,13 @@ def expected_values_from_config(config_yaml: Dict[str, Any]) -> Dict[str, Any]:
         "image_size": int(expected_model.get("image_size", DEFAULT_IMAGE_SIZE)),
         "channels": int(expected_model.get("channels", DEFAULT_CHANNELS)),
         "num_classes": int(expected_model.get("num_classes", DEFAULT_NUM_CLASSES)),
-        "checkpoint_mean": expected_model.get("checkpoint_mean", DEFAULT_MEAN),
-        "checkpoint_std": expected_model.get("checkpoint_std", DEFAULT_STD),
+        "checkpoint_mean": expected_model.get("checkpoint_mean"),
+        "checkpoint_std": expected_model.get("checkpoint_std"),
     }
 
 
-def validate_checkpoint_identity(
-    summary: Dict[str, Any],
-    expected: Dict[str, Any],
-    *,
-    strict: bool,
-) -> List[str]:
+def validate_checkpoint_identity(summary: Dict[str, Any], expected: Dict[str, Any], *, strict: bool) -> List[str]:
+    """Non-hash identity checks: variant, image size, channels, mean/std length."""
     warnings_out: List[str] = []
 
     def handle(message: str, fatal: bool = True) -> None:
@@ -574,148 +481,151 @@ def validate_checkpoint_identity(
             raise RuntimeError(message)
         warnings_out.append(message)
 
-    if summary["architecture_hash"] not in (None, "unknown"):
-        if str(summary["architecture_hash"]) != str(expected["architecture_hash"]):
-            handle(
-                f"Architecture hash mismatch: checkpoint={summary['architecture_hash']} "
-                f"expected={expected['architecture_hash']}"
-            )
-    else:
-        handle("Checkpoint architecture hash is missing/unknown.", fatal=False)
-
-    if summary["model_variant"] and expected["model_variant"]:
-        if str(summary["model_variant"]) != str(expected["model_variant"]):
-            # Some artifacts store model_class but not model_variant. Treat this
-            # as fatal only if both are specific and conflicting.
-            handle(
-                f"Model variant mismatch: checkpoint={summary['model_variant']} "
-                f"expected={expected['model_variant']}",
-                fatal=False,
-            )
-
+    if summary["model_variant"] and expected["model_variant"] and str(summary["model_variant"]) != str(expected["model_variant"]):
+        handle(f"Model variant mismatch: checkpoint={summary['model_variant']} expected={expected['model_variant']}",
+               fatal=False)
     if summary["image_size"] is not None and int(summary["image_size"]) != int(expected["image_size"]):
-        handle(
-            f"Image size mismatch: checkpoint={summary['image_size']} "
-            f"expected={expected['image_size']}"
-        )
-
+        handle(f"Image size mismatch: checkpoint={summary['image_size']} expected={expected['image_size']}")
     if summary["channels"] is not None and int(summary["channels"]) != int(expected["channels"]):
-        handle(
-            f"Channel mismatch: checkpoint={summary['channels']} "
-            f"expected={expected['channels']}"
-        )
-
-    if len(summary["mean"]) != int(expected["channels"]):
-        handle(
-            f"Mean length {len(summary['mean'])} does not match channels "
-            f"{expected['channels']}."
-        )
-
-    if len(summary["std"]) != int(expected["channels"]):
-        handle(
-            f"Std length {len(summary['std'])} does not match channels "
-            f"{expected['channels']}."
-        )
-
+        handle(f"Channel mismatch: checkpoint={summary['channels']} expected={expected['channels']}")
+    if len(summary["mean"]) != int(expected["channels"]) or len(summary["std"]) != int(expected["channels"]):
+        handle(f"Mean/std length does not match channels {expected['channels']}.")
     return warnings_out
 
 
-def validate_config_arch_hash(
+def verify_architecture_identity(
+    *,
     checkpoint: Dict[str, Any],
     config: Dict[str, Any],
-    *,
+    config_source: str,
+    arch_metadata: Dict[str, Any],
+    provenance_checkpoint: Optional[Dict[str, Any]],
+    expected_hash: str,
     strict: bool,
-) -> List[str]:
+) -> Dict[str, Any]:
     """
-    Use the project's validate_checkpoint_arch when possible.
-
-    If the checkpoint lacks arch_metadata but the external summary already
-    validated architecture_hash, this function will warn rather than fail unless
-    strict validation is impossible.
+    Establish architecture identity independently of training_logic's lenient
+    validator (F-01). Returns a record; raises in strict mode on any mismatch
+    or when no hash could be obtained.
     """
-    warnings_out: List[str] = []
+    _, validate_checkpoint_arch, compute_arch_hash = _import_training_factory()
 
+    candidates: List[Tuple[str, Optional[str]]] = []
+    stored = arch_metadata.get("arch_hash") if arch_metadata else None
+    candidates.append(("stored_arch_metadata", str(stored) if stored else None))
+
+    recomputed: Optional[str] = None
+    recompute_error: Optional[str] = None
     try:
-        _, validate_checkpoint_arch, _ = _import_training_factory()
-    except ImportError as exc:
-        if strict:
-            raise
-        warnings_out.append(str(exc))
-        return warnings_out
+        recomputed = str(compute_arch_hash(config))
+    except Exception as exc:  # recorded; becomes fatal only if nothing else validates
+        recompute_error = f"{type(exc).__name__}: {exc}"
+    candidates.append(("recomputed_from_embedded_config", recomputed))
 
-    try:
-        validate_checkpoint_arch(checkpoint, config, strict=True)
-    except Exception as exc:
-        if strict:
-            raise RuntimeError(f"Project architecture validation failed: {exc}") from exc
-        warnings_out.append(f"Project architecture validation warning: {exc}")
+    prov_hash: Optional[str] = None
+    if provenance_checkpoint is not None:
+        prov_meta = extract_arch_metadata(provenance_checkpoint)
+        prov_hash = str(prov_meta["arch_hash"]) if prov_meta.get("arch_hash") else None
+    candidates.append(("provenance_arch_metadata", prov_hash))
 
-    return warnings_out
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            validate_checkpoint_arch(checkpoint, config, strict=True)
+            training_logic_validator = "passed_or_skipped"
+        except Exception as exc:
+            training_logic_validator = f"failed: {exc}"
+    validator_warnings = [str(w.message) for w in caught]
+
+    mismatches = [(m, h) for m, h in candidates if h is not None and h != str(expected_hash)]
+    matches = [m for m, h in candidates if h is not None and h == str(expected_hash)]
+    method = matches[0] if matches else "not_validated"
+    validated = bool(matches) and not mismatches and not training_logic_validator.startswith("failed")
+
+    record = {
+        "architecture_hash_expected": str(expected_hash),
+        "architecture_hash_observed": recomputed,
+        "architecture_hash_stored": stored,
+        "architecture_hash_provenance": prov_hash,
+        "architecture_validation_method": method,
+        "architecture_hash_validated": validated,
+        "config_source": config_source,
+        "recompute_error": recompute_error,
+        "training_logic_validator": training_logic_validator,
+        "training_logic_validator_warnings": validator_warnings,
+        "candidate_hashes": {m: h for m, h in candidates},
+    }
+    if mismatches or not matches or training_logic_validator.startswith("failed"):
+        msg = (
+            "Architecture hash mismatch or architecture not validated: "
+            f"expected={expected_hash}, candidates={record['candidate_hashes']}, "
+            f"recompute_error={recompute_error}, training_logic_validator={training_logic_validator}"
+        )
+        if strict:
+            raise RuntimeError(msg)
+        warnings.warn(msg)
+    return record
 
 
 def compare_provenance_checkpoint(
     primary_state: Dict[str, torch.Tensor],
+    primary_mean: Sequence[float],
+    primary_std: Sequence[float],
+    provenance_ckpt: Dict[str, Any],
     provenance_path: Union[str, Path],
     *,
     strict: bool,
 ) -> Dict[str, Any]:
+    """Weight and normalisation equivalence between primary and provenance checkpoints."""
     provenance_path = Path(provenance_path)
-    prov_ckpt = torch_load_checkpoint(provenance_path)
-    prov_state = extract_model_state_dict(prov_ckpt)
-
-    primary_keys = set(primary_state.keys())
-    provenance_keys = set(prov_state.keys())
-
+    prov_state = extract_model_state_dict(provenance_ckpt)
+    primary_keys, provenance_keys = set(primary_state.keys()), set(prov_state.keys())
     key_match = primary_keys == provenance_keys
-    shape_match = True
-    dtype_match = True
-
-    missing_in_provenance = sorted(primary_keys - provenance_keys)
-    extra_in_provenance = sorted(provenance_keys - primary_keys)
-
     mismatched_shapes: List[str] = []
     mismatched_dtypes: List[str] = []
-
     if key_match:
         for key in sorted(primary_keys):
-            a = primary_state[key]
-            b = prov_state[key]
+            a, b = primary_state[key], prov_state[key]
             if torch.is_tensor(a) and torch.is_tensor(b):
                 if tuple(a.shape) != tuple(b.shape):
-                    shape_match = False
                     mismatched_shapes.append(key)
                 if a.dtype != b.dtype:
-                    dtype_match = False
                     mismatched_dtypes.append(key)
-
     max_abs_diff = max_abs_state_dict_difference(primary_state, prov_state) if key_match else None
-    tensor_values_identical = bool(max_abs_diff == 0.0) if max_abs_diff is not None else False
+    values_identical = bool(max_abs_diff == 0.0) if max_abs_diff is not None else False
+
+    prov_mean, prov_std, prov_source = resolve_normalization_stats(provenance_ckpt)
+    mean_std_matches = None
+    if prov_mean is not None and prov_std is not None:
+        mean_std_matches = all(
+            abs(a - b) <= MEAN_STD_REL_TOLERANCE * max(abs(b), 1e-12)
+            for a, b in zip(list(primary_mean) + list(primary_std), prov_mean + prov_std)
+        ) and len(prov_mean) == len(primary_mean)
 
     result = {
         "provenance_checkpoint_path": str(provenance_path),
         "provenance_file_sha256": sha256_file(provenance_path),
         "key_match": key_match,
-        "shape_match": shape_match,
-        "dtype_match": dtype_match,
-        "tensor_values_identical": tensor_values_identical,
+        "shape_match": not mismatched_shapes,
+        "dtype_match": not mismatched_dtypes,
+        "tensor_values_identical": values_identical,
         "max_abs_difference": max_abs_diff,
         "primary_n_tensors": len(primary_state),
         "provenance_n_tensors": len(prov_state),
-        "missing_keys_in_provenance": missing_in_provenance[:50],
-        "extra_keys_in_provenance": extra_in_provenance[:50],
+        "missing_keys_in_provenance": sorted(primary_keys - provenance_keys)[:50],
+        "extra_keys_in_provenance": sorted(provenance_keys - primary_keys)[:50],
         "mismatched_shape_keys": mismatched_shapes[:50],
         "mismatched_dtype_keys": mismatched_dtypes[:50],
+        "provenance_mean_std_source": prov_source,
+        "mean_std_matches_provenance": mean_std_matches,
     }
-
-    ok = key_match and shape_match and dtype_match and tensor_values_identical
+    ok = key_match and not mismatched_shapes and not mismatched_dtypes and values_identical and mean_std_matches is not False
     result["equivalence_status"] = "equivalent" if ok else "different"
-
     if strict and not ok:
         raise RuntimeError(
             "Primary checkpoint and provenance checkpoint are not equivalent. "
             f"Comparison result: {json.dumps(result, indent=2)}"
         )
-
     return result
 
 
@@ -724,63 +634,34 @@ def compare_provenance_checkpoint(
 # -----------------------------------------------------------------------------
 
 def build_and_load_model(
-    checkpoint: Dict[str, Any],
     config: Dict[str, Any],
     state_dict: Dict[str, torch.Tensor],
     *,
     device: torch.device,
     num_classes: int,
-    strict_state_dict: bool = True,
 ) -> nn.Module:
     build_model, _, _ = _import_training_factory()
-
     model = build_model(config=config, num_classes=num_classes, device=device)
-
-    missing, unexpected = model.load_state_dict(state_dict, strict=strict_state_dict)
-    # In strict=True, PyTorch raises before returning incompatible keys. In
-    # strict=False, handle explicitly.
-    if missing or unexpected:
-        raise RuntimeError(
-            f"State_dict load produced missing={missing}, unexpected={unexpected}"
-        )
-
+    model.load_state_dict(state_dict, strict=True)  # raises on missing/unexpected keys or shapes
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)
-
     return model
 
 
-def run_smoke_test(
-    model: nn.Module,
-    *,
-    image_size: int,
-    channels: int,
-    num_classes: int,
-    device: torch.device,
-) -> Dict[str, Any]:
+def run_smoke_test(model: nn.Module, *, image_size: int, channels: int, num_classes: int,
+                   device: torch.device) -> Dict[str, Any]:
     with torch.no_grad():
         x = torch.zeros((1, int(channels), int(image_size), int(image_size)), device=device)
         y = model(x)
-
-    if not torch.is_tensor(y):
-        raise RuntimeError(f"Model output is not a tensor: {type(y)}")
-
-    if tuple(y.shape) != (1, int(num_classes)):
-        raise RuntimeError(
-            f"Unexpected model output shape {tuple(y.shape)}, expected "
-            f"(1, {num_classes})."
-        )
-
+    if not torch.is_tensor(y) or tuple(y.shape) != (1, int(num_classes)):
+        raise RuntimeError(f"Unexpected smoke-test output {getattr(y, 'shape', type(y))}.")
     if not torch.all(torch.isfinite(y)).item():
         raise RuntimeError("Smoke-test output contains non-finite values.")
-
     return {
         "smoke_test_passed": True,
         "input_shape": [1, int(channels), int(image_size), int(image_size)],
         "output_shape": list(y.shape),
-        "output_min": float(y.min().detach().cpu().item()),
-        "output_max": float(y.max().detach().cpu().item()),
     }
 
 
@@ -797,106 +678,75 @@ def load_frozen_hybrid(
     run_dummy_forward: bool = False,
 ) -> Dict[str, Any]:
     """
-    Load the frozen LSA-ConvTok Hybrid model safely for external validation.
+    Load the frozen model for external validation.
 
-    Parameters
-    ----------
-    checkpoint_path:
-        Primary exported inference artifact, expected final_model_lsa_convtok.pth.
-    provenance_checkpoint_path:
-        Optional full final_model_checkpoint.pth used only for equivalence/provenance.
-    config_path:
-        Optional external_validation_config.yaml. Supplies expected model identity.
-    device:
-        "auto", "cpu", "cuda", or torch.device.
-    strict:
-        If True, abort on identity or provenance inconsistencies.
-    run_dummy_forward:
-        If True, run a zero-input no-gradient smoke test.
-
-    Returns
-    -------
-    dict
-        {
-          "model": nn.Module,
-          "mean": list[float],
-          "std": list[float],
-          "config": dict,
-          "metadata": dict,
-          "device": torch.device,
-          "class_names": list[str],
-        }
+    Returns {"model", "mean", "std", "config", "metadata", "device", "class_names"}.
+    The model is in eval mode with gradients disabled.
     """
     checkpoint_path = Path(checkpoint_path)
     config_yaml = load_optional_yaml_config(Path(config_path) if config_path else None)
     expected = expected_values_from_config(config_yaml)
     resolved_device = resolve_device(device)
 
-    primary_ckpt = torch_load_checkpoint(checkpoint_path)
+    primary_ckpt, primary_load_mode = torch_load_checkpoint(checkpoint_path)
     arch_metadata = extract_arch_metadata(primary_ckpt)
-    config = extract_config(primary_ckpt, arch_metadata)
+    config, config_source = extract_config(primary_ckpt, arch_metadata)
     state_dict = extract_model_state_dict(primary_ckpt)
-    mean, std = extract_mean_std(primary_ckpt, config)
-
-    summary = checkpoint_summary(
-        path=checkpoint_path,
-        checkpoint=primary_ckpt,
-        config=config,
-        arch_metadata=arch_metadata,
-        state_dict=state_dict,
-        mean=mean,
-        std=std,
+    mean, std, mean_std_info = resolve_mean_std(
+        primary_ckpt,
+        expected_mean=expected["checkpoint_mean"],
+        expected_std=expected["checkpoint_std"],
+        strict=strict,
     )
 
+    summary = checkpoint_summary(checkpoint_path, primary_ckpt, config, arch_metadata, state_dict, mean, std)
     identity_warnings = validate_checkpoint_identity(summary, expected, strict=strict)
-    arch_warnings = validate_config_arch_hash(primary_ckpt, config, strict=strict)
+
+    provenance_ckpt: Optional[Dict[str, Any]] = None
+    provenance_load_mode: Optional[str] = None
+    if provenance_checkpoint_path is not None:
+        provenance_ckpt, provenance_load_mode = torch_load_checkpoint(provenance_checkpoint_path)
+
+    architecture = verify_architecture_identity(
+        checkpoint=primary_ckpt,
+        config=config,
+        config_source=config_source,
+        arch_metadata=arch_metadata,
+        provenance_checkpoint=provenance_ckpt,
+        expected_hash=str(expected["architecture_hash"]),
+        strict=strict,
+    )
 
     provenance_result = None
-    if provenance_checkpoint_path is not None:
+    if provenance_ckpt is not None:
         provenance_result = compare_provenance_checkpoint(
-            primary_state=state_dict,
-            provenance_path=provenance_checkpoint_path,
-            strict=strict,
+            state_dict, mean, std, provenance_ckpt, provenance_checkpoint_path, strict=strict
         )
 
-    model = build_and_load_model(
-        checkpoint=primary_ckpt,
-        config=config,
-        state_dict=state_dict,
-        device=resolved_device,
-        num_classes=int(expected["num_classes"]),
-        strict_state_dict=True,
-    )
+    model = build_and_load_model(config, state_dict, device=resolved_device, num_classes=int(expected["num_classes"]))
 
     smoke = None
     if run_dummy_forward:
-        smoke = run_smoke_test(
-            model,
-            image_size=int(expected["image_size"]),
-            channels=int(expected["channels"]),
-            num_classes=int(expected["num_classes"]),
-            device=resolved_device,
-        )
+        smoke = run_smoke_test(model, image_size=int(expected["image_size"]), channels=int(expected["channels"]),
+                               num_classes=int(expected["num_classes"]), device=resolved_device)
 
-    class_names = get_nested(
-        config_yaml,
-        ["labels", "class_names"],
-        ["Candida albicans", "Candida glabrata"],
-    )
+    class_names = get_nested(config_yaml, ["labels", "class_names"], ["Candida albicans", "Candida glabrata"])
 
     metadata = {
-        "schema_version": "1.0",
+        "schema_version": LOADER_SCHEMA_VERSION,
         "script": "load_frozen_hybrid.py",
         "created_unix_time": time.time(),
-        "scientific_role": (
-            "Frozen checkpoint loader for external validation. The returned model "
-            "is in eval mode with gradients disabled."
-        ),
+        "scientific_role": "Frozen checkpoint loader for external validation (eval mode, gradients disabled).",
         "primary_checkpoint": summary,
+        "checkpoint_load_mode": primary_load_mode,
+        "provenance_checkpoint_load_mode": provenance_load_mode,
         "provenance_comparison": provenance_result,
         "expected_model": expected,
+        "architecture_identity": architecture,
         "identity_warnings": identity_warnings,
-        "project_architecture_validation_warnings": arch_warnings,
+        **mean_std_info,
+        "mean_std_matches_provenance": (provenance_result or {}).get("mean_std_matches_provenance"),
+        "training_logic_file": training_logic_file(),
         "device": str(resolved_device),
         "mean": [float(v) for v in mean],
         "std": [float(v) for v in std],
@@ -907,12 +757,12 @@ def load_frozen_hybrid(
         "scientific_guardrails": {
             "primary_artifact_is_exported_inference_checkpoint": True,
             "provenance_checkpoint_used_only_for_equivalence_check": provenance_checkpoint_path is not None,
-            "architecture_hash_validated": True,
+            "architecture_hash_validated": bool(architecture["architecture_hash_validated"]),
+            "architecture_validation_method": architecture["architecture_validation_method"],
             "no_training_state_used_for_inference": True,
             "no_gradients_enabled": True,
         },
     }
-
     return {
         "model": model,
         "mean": [float(v) for v in mean],
@@ -925,60 +775,32 @@ def load_frozen_hybrid(
 
 
 def save_loader_metadata(bundle: Dict[str, Any], path: Path) -> None:
-    metadata = dict(bundle["metadata"])
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2, ensure_ascii=False)
+        json.dump(dict(bundle["metadata"]), f, indent=2, ensure_ascii=False)
 
 
 def print_loader_summary(bundle: Dict[str, Any]) -> None:
     meta = bundle["metadata"]
-    primary = meta["primary_checkpoint"]
-    prov = meta.get("provenance_comparison")
-
+    arch = meta["architecture_identity"]
     print("\n" + "=" * 80)
     print("FROZEN HYBRID MODEL LOADED")
     print("=" * 80)
-    print(f"Checkpoint       : {primary['path']}")
-    print(f"Model variant    : {primary['model_variant']}")
-    print(f"Experiment       : {primary['experiment_name']}")
-    print(f"Arch hash        : {primary['architecture_hash']}")
-    print(f"Image size       : {primary['image_size']}")
-    print(f"Channels         : {primary['channels']}")
-    print(f"Mean             : {meta['mean']}")
-    print(f"Std              : {meta['std']}")
-    print(f"Device           : {meta['device']}")
-    print(f"Eval mode        : {meta['model_eval_mode']}")
-    print(f"Grad disabled    : {meta['all_parameters_require_grad_false']}")
-
-    if prov is not None:
-        print("\nProvenance checkpoint comparison:")
-        print(f"  - status           : {prov['equivalence_status']}")
-        print(f"  - key_match        : {prov['key_match']}")
-        print(f"  - shape_match      : {prov['shape_match']}")
-        print(f"  - dtype_match      : {prov['dtype_match']}")
-        print(f"  - values_identical : {prov['tensor_values_identical']}")
-        print(f"  - max_abs_diff     : {prov['max_abs_difference']}")
-
-    if meta.get("smoke_test"):
-        print("\nSmoke test:")
-        print(f"  - passed       : {meta['smoke_test']['smoke_test_passed']}")
-        print(f"  - input_shape  : {meta['smoke_test']['input_shape']}")
-        print(f"  - output_shape : {meta['smoke_test']['output_shape']}")
-
-    if meta.get("identity_warnings") or meta.get("project_architecture_validation_warnings"):
-        print("\nWarnings:")
-        for w in meta.get("identity_warnings", []):
-            print(f"  - {w}")
-        for w in meta.get("project_architecture_validation_warnings", []):
-            print(f"  - {w}")
-
+    print(f"Checkpoint        : {meta['primary_checkpoint']['path']}")
+    print(f"Load mode         : {meta['checkpoint_load_mode']}")
+    print(f"Arch hash expected: {arch['architecture_hash_expected']}")
+    print(f"Arch validated    : {arch['architecture_hash_validated']} ({arch['architecture_validation_method']})")
+    print(f"Mean/std          : {meta['mean']} / {meta['std']} (source {meta['mean_std_source']})")
+    print(f"training_logic    : {meta['training_logic_file']}")
+    print(f"Device            : {meta['device']}")
+    if meta.get("provenance_comparison"):
+        print(f"Provenance        : {meta['provenance_comparison']['equivalence_status']}")
     print("=" * 80 + "\n")
 
 
 def main() -> None:
     args = parse_args()
-
     bundle = load_frozen_hybrid(
         checkpoint_path=args.checkpoint,
         provenance_checkpoint_path=args.provenance_checkpoint,
@@ -987,10 +809,8 @@ def main() -> None:
         strict=args.strict,
         run_dummy_forward=args.smoke_test,
     )
-
     if args.metadata_output is not None:
         save_loader_metadata(bundle, args.metadata_output)
-
     print_loader_summary(bundle)
 
 

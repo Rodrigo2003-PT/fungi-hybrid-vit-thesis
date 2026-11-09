@@ -21,6 +21,16 @@ probability rule:
 Primary metrics are slide-level. Image-level metrics are reported only as
 secondary/descriptive because images from the same slide are correlated.
 
+Consistency guards
+------------------
+* The preprocessed directory's ``preprocessing_metadata.json`` must agree with
+  this run's ``--preprocessing-mode``, ``--arrays-already-standardized`` and
+  the checkpoint image size (F-17); otherwise the run aborts in strict mode.
+* Expected cohort counts are read from the metadata JSON (or config), not
+  hard-coded (F-14).
+* The input-distribution summary samples images balanced across slides
+  (F-09); it is descriptive provenance only.
+
 Inputs
 ------
     - final_model_lsa_convtok.pth
@@ -28,6 +38,7 @@ Inputs
     - external_manifest.csv
     - preprocessed external .npy directory from preprocess_external.py
     - optional external_validation_config.yaml
+    - optional external_validation_metadata.json (cohort counts, optics hash)
 
 Outputs
 -------
@@ -40,17 +51,6 @@ Outputs
       confusion_matrix_slide.csv
       external_validation_metadata.json
 
-Usage
------
-    python evaluate_external_generalization.py \\
-        --checkpoint final_model_lsa_convtok.pth \\
-        --provenance-checkpoint final_model_checkpoint.pth \\
-        --manifest outputs_external/manifest/external_manifest.csv \\
-        --preprocessed-dir outputs_external/preprocessed/locked_pixel_pipeline \\
-        --config configs/external_validation_config.yaml \\
-        --output-dir outputs_external/evaluation/locked_pixel_pipeline \\
-        --batch-size 64
-
 Author: Rodrigo Sá
 Date: 2026
 """
@@ -61,12 +61,11 @@ import argparse
 import csv
 import json
 import math
-import os
 import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -83,12 +82,18 @@ from sklearn.metrics import (
 )
 
 try:
-    from load_frozen_hybrid import load_frozen_hybrid, save_loader_metadata
+    from load_frozen_hybrid import load_frozen_hybrid
 except Exception as exc:
     raise ImportError(
         "Could not import load_frozen_hybrid.py. Ensure it is in the same "
         "directory or on PYTHONPATH."
     ) from exc
+
+from optics_provenance import optics_provenance_record
+from pipeline_common import expected_cohort_counts, load_optional_yaml, read_json
+
+EVALUATION_SCHEMA_VERSION = "2.0"
+PREPROCESSING_METADATA_FILENAME = "preprocessing_metadata.json"
 
 
 IMAGE_PREDICTION_COLUMNS = [
@@ -129,7 +134,7 @@ SLIDE_PREDICTION_COLUMNS = [
 CONFUSION_COLUMNS = ["true_label", "pred_label", "count"]
 
 
-def parse_args() -> argparse.Namespace:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run frozen-model external validation on preprocessed external "
@@ -168,6 +173,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional external_validation_config.yaml.",
     )
     parser.add_argument(
+        "--metadata",
+        type=Path,
+        default=None,
+        help="Optional external_validation_metadata.json (expected cohort counts and optics hash).",
+    )
+    parser.add_argument(
         "--output-dir",
         required=True,
         type=Path,
@@ -196,9 +207,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=256,
         help=(
-            "Maximum number of preprocessed arrays to re-read for the metadata input-distribution "
-            "summary. This avoids a full second pass over all .npy files in Colab. Set 0 to skip; "
-            "set -1 to summarize all images as in the original implementation."
+            "Maximum number of preprocessed arrays re-read for the descriptive input-distribution "
+            "summary, sampled balanced across slides with a fixed seed. 0 skips; -1 uses all images."
         ),
     )
     parser.add_argument(
@@ -232,34 +242,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run model loader dummy forward smoke test.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed for the balanced input-distribution sample (descriptive only).",
+    )
+    return parser
 
 
-def load_optional_yaml_config(path: Optional[Path]) -> Dict[str, Any]:
-    if path is None:
-        return {}
-    if not path.exists():
-        raise FileNotFoundError(f"Config YAML not found: {path}")
-    try:
-        import yaml
-    except ImportError:
-        print(
-            "WARNING: PyYAML not installed; continuing without parsing YAML config.",
-            file=sys.stderr,
-        )
-        return {}
-    with path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    return data if isinstance(data, dict) else {}
-
-
-def get_nested(data: Dict[str, Any], keys: Sequence[str], default: Any = None) -> Any:
-    cur: Any = data
-    for key in keys:
-        if not isinstance(cur, dict) or key not in cur:
-            return default
-        cur = cur[key]
-    return cur
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    return build_arg_parser().parse_args(argv)
 
 
 def read_manifest(path: Path) -> List[Dict[str, str]]:
@@ -607,12 +600,18 @@ def add_preprocessing_mode_to_image_rows(rows: List[Dict[str, Any]], mode: str) 
         row["preprocessing_mode"] = mode
 
 
-def validate_manifest_cohort(rows: List[Dict[str, str]], strict: bool = True) -> List[str]:
+def validate_manifest_cohort(
+    rows: List[Dict[str, str]],
+    *,
+    expected_total: Optional[int],
+    expected_per_species: Dict[str, int],
+    strict: bool = True,
+) -> List[str]:
+    """One label/species/hyphae status per slide, and cohort counts from metadata/config (F-14)."""
     warnings_out: List[str] = []
     slide_to_labels: Dict[str, set] = defaultdict(set)
     slide_to_species: Dict[str, set] = defaultdict(set)
     slide_to_hyphae: Dict[str, set] = defaultdict(set)
-
     for row in rows:
         sid = row["slide_id"]
         slide_to_labels[sid].add(row["label"])
@@ -628,33 +627,109 @@ def validate_manifest_cohort(rows: List[Dict[str, str]], strict: bool = True) ->
         if len(slide_to_hyphae[sid]) != 1:
             errors.append(f"Mixed hyphae status in slide {sid}: {sorted(slide_to_hyphae[sid])}")
 
+    count_msgs: List[str] = []
     n_slides = len(slide_to_labels)
-    if n_slides != 24:
-        msg = f"Expected 24 external slides, observed {n_slides}."
-        if strict:
-            errors.append(msg)
-        else:
-            warnings_out.append(msg)
-
+    if expected_total is None:
+        warnings_out.append("No expected cohort counts available (metadata/config); count check skipped.")
+    elif n_slides != int(expected_total):
+        count_msgs.append(f"Expected {expected_total} external slides, observed {n_slides}.")
     species_slide_counts = Counter(next(iter(v)) for v in slide_to_species.values())
-    if species_slide_counts.get("Candida albicans", 0) != 12:
-        msg = f"Expected 12 Candida albicans slides, observed {species_slide_counts.get('Candida albicans', 0)}."
-        if strict:
-            errors.append(msg)
-        else:
-            warnings_out.append(msg)
-    if species_slide_counts.get("Candida glabrata", 0) != 12:
-        msg = f"Expected 12 Candida glabrata slides, observed {species_slide_counts.get('Candida glabrata', 0)}."
-        if strict:
-            errors.append(msg)
-        else:
-            warnings_out.append(msg)
+    for species, expected in sorted(expected_per_species.items()):
+        if species_slide_counts.get(species, 0) != int(expected):
+            count_msgs.append(f"Expected {expected} {species} slides, observed {species_slide_counts.get(species, 0)}.")
+    (errors if strict else warnings_out).extend(count_msgs)
 
     if errors:
         raise RuntimeError("Manifest cohort validation failed:\n  - " + "\n  - ".join(errors))
-
     return warnings_out
 
+
+def check_preprocessing_consistency(
+    preprocessed_dir: Path,
+    *,
+    preprocessing_mode: str,
+    arrays_already_standardized: bool,
+    model_image_size: Optional[int],
+    optics_sha256: Optional[str],
+    strict: bool,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Cross-check this evaluation run against the preprocessing sidecar (F-17).
+    Mismatches in mode, standardization or image size are fatal in strict mode.
+    """
+    path = preprocessed_dir / PREPROCESSING_METADATA_FILENAME
+    warnings_out: List[str] = []
+    if not path.exists():
+        msg = f"{path} not found; cannot verify preprocessing/evaluation consistency."
+        if strict:
+            raise RuntimeError(msg)
+        return {"available": False}, [msg]
+    meta = read_json(path)
+    problems: List[str] = []
+    if str(meta.get("preprocessing_mode")) != str(preprocessing_mode):
+        problems.append(
+            f"preprocessing_mode mismatch: arrays={meta.get('preprocessing_mode')!r}, evaluation={preprocessing_mode!r}."
+        )
+    if bool(meta.get("save_standardized")) != bool(arrays_already_standardized):
+        problems.append(
+            f"Standardization mismatch: arrays save_standardized={meta.get('save_standardized')}, "
+            f"--arrays-already-standardized={arrays_already_standardized} (would double- or under-standardize)."
+        )
+    if model_image_size is not None and meta.get("image_size") is not None and int(meta["image_size"]) != int(model_image_size):
+        problems.append(f"image_size mismatch: arrays={meta.get('image_size')}, model={model_image_size}.")
+    pre_optics = (meta.get("optics_reference") or {}).get("optics_sha256")
+    if optics_sha256 and pre_optics and pre_optics != optics_sha256:
+        problems.append(f"optics_sha256 mismatch between preprocessing ({pre_optics}) and evaluation ({optics_sha256}).")
+    if problems:
+        if strict:
+            raise RuntimeError("Preprocessing/evaluation inconsistency:\n  - " + "\n  - ".join(problems))
+        warnings_out.extend(problems)
+    return {
+        "available": True,
+        "path": str(path),
+        "preprocessing_schema_version": meta.get("schema_version"),
+        "preprocessing_mode": meta.get("preprocessing_mode"),
+        "save_standardized": meta.get("save_standardized"),
+        "image_size": meta.get("image_size"),
+        "fingerprint_sha256": (meta.get("fingerprint") or {}).get("fingerprint_sha256"),
+        "optics_sha256": pre_optics,
+        "consistent": not problems,
+    }, warnings_out
+
+
+def select_distribution_sample(
+    rows: List[Dict[str, str]],
+    max_images: Optional[int],
+    seed: int,
+) -> List[Dict[str, str]]:
+    """
+    Slide-balanced deterministic sample (F-09): ceil(k / n_slides) images per
+    slide chosen with a seeded RNG, truncated to k in slide order. ``None``
+    means all rows.
+    """
+    if max_images is None:
+        return list(rows)
+    k = max(0, int(max_images))
+    if k == 0:
+        return []
+    by_slide: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    for r in rows:
+        by_slide[r["slide_id"]].append(r)
+    per_slide = max(1, math.ceil(k / max(1, len(by_slide))))
+    rng = np.random.default_rng(int(seed))
+    picked_by_slide: Dict[str, List[Dict[str, str]]] = {}
+    for sid in sorted(by_slide):
+        srows = sorted(by_slide[sid], key=lambda r: r["relative_path"])
+        idx = sorted(rng.choice(len(srows), size=min(per_slide, len(srows)), replace=False).tolist())
+        picked_by_slide[sid] = [srows[i] for i in idx]
+    out: List[Dict[str, str]] = []
+    round_idx = 0
+    while len(out) < k and any(round_idx < len(v) for v in picked_by_slide.values()):
+        for sid in sorted(picked_by_slide):
+            if round_idx < len(picked_by_slide[sid]) and len(out) < k:
+                out.append(picked_by_slide[sid][round_idx])
+        round_idx += 1
+    return out
 
 
 def summarize_preprocessed_input_distribution(
@@ -665,6 +740,7 @@ def summarize_preprocessed_input_distribution(
     *,
     arrays_already_standardized: bool,
     max_images: Optional[int] = None,
+    seed: int = 42,
 ) -> Dict[str, Any]:
     """
     Summarize the numeric distribution of the model inputs used for inference.
@@ -683,7 +759,7 @@ def summarize_preprocessed_input_distribution(
     standardized_mean_values: List[float] = []
     standardized_std_values: List[float] = []
 
-    rows = manifest_rows if max_images is None else manifest_rows[: max(0, int(max_images))]
+    rows = select_distribution_sample(manifest_rows, max_images, seed)
     missing = 0
 
     for row in rows:
@@ -738,6 +814,9 @@ def summarize_preprocessed_input_distribution(
         ),
         "n_manifest_images": len(manifest_rows),
         "n_images_summarized": len(raw_mean_values),
+        "sampling": "all_images" if max_images is None else "per_slide_balanced_seeded",
+        "n_slides_covered": len({r["slide_id"] for r in rows}),
+        "seed": int(seed),
         "n_missing_npy_files": int(missing),
         "max_images_requested": max_images,
         "arrays_already_standardized": bool(arrays_already_standardized),
@@ -766,6 +845,9 @@ def create_metadata(
     elapsed_seconds: float,
     manifest_warnings: List[str],
     input_distribution_summary: Optional[Dict[str, Any]] = None,
+    preprocessing_consistency: Optional[Dict[str, Any]] = None,
+    optics_record: Optional[Dict[str, Any]] = None,
+    cohort_count_source: str = "not_specified",
 ) -> Dict[str, Any]:
     species_image_counts = Counter(row["species_name"] for row in manifest_rows)
     slide_ids = sorted({row["slide_id"] for row in manifest_rows})
@@ -778,7 +860,7 @@ def create_metadata(
         hyphae_slide_counts[r["hyphae_status"]] += 1
 
     return {
-        "schema_version": "1.0",
+        "schema_version": EVALUATION_SCHEMA_VERSION,
         "script": "evaluate_external_generalization.py",
         "created_unix_time": time.time(),
         "elapsed_seconds": elapsed_seconds,
@@ -793,7 +875,11 @@ def create_metadata(
             "manifest": str(args.manifest),
             "preprocessed_dir": str(args.preprocessed_dir),
             "config": str(args.config) if args.config else None,
+            "metadata": str(args.metadata) if args.metadata else None,
         },
+        "optics_sha256": (optics_record or {}).get("optics_sha256"),
+        "optics_provenance_gaps": (optics_record or {}).get("provenance_gaps", []),
+        "preprocessing_consistency": preprocessing_consistency,
         "preprocessing": {
             "mode": args.preprocessing_mode,
             "arrays_already_standardized": bool(args.arrays_already_standardized),
@@ -824,6 +910,7 @@ def create_metadata(
             "species_slide_counts": dict(sorted(species_slide_counts.items())),
             "hyphae_slide_counts": dict(sorted(hyphae_slide_counts.items())),
             "manifest_validation_warnings": manifest_warnings,
+            "expected_count_source": cohort_count_source,
         },
         "evaluation_policy": {
             "primary_unit": "slide",
@@ -849,6 +936,10 @@ def create_metadata(
             "slide_level_primary": True,
             "image_level_descriptive_only": True,
             "hyphae_status_used_only_for_subgroup_analysis": True,
+            "architecture_hash_validated": bool(
+                (loader_metadata.get("scientific_guardrails") or {}).get("architecture_hash_validated", False)
+            ),
+            "inference_precision": "float32 (training validation used CUDA autocast; difference documented, not corrected)",
         },
     }
 
@@ -889,9 +980,21 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    config = load_optional_yaml_config(args.config)
-    manifest_rows = read_manifest(args.manifest)
-    manifest_warnings = validate_manifest_cohort(manifest_rows, strict=args.strict)
+    config = load_optional_yaml(args.config)
+    metadata_json = read_json(args.metadata) if args.metadata else None
+    optics_record = (
+        optics_provenance_record(metadata_json["optics"])
+        if metadata_json and isinstance(metadata_json.get("optics"), dict)
+        else None
+    )
+    manifest_rows = sorted(read_manifest(args.manifest), key=lambda r: r["relative_path"])
+    expected_total, expected_per_species, count_source = expected_cohort_counts(metadata_json, config)
+    manifest_warnings = validate_manifest_cohort(
+        manifest_rows,
+        expected_total=expected_total,
+        expected_per_species=expected_per_species,
+        strict=args.strict,
+    )
 
     bundle = load_frozen_hybrid(
         checkpoint_path=args.checkpoint,
@@ -906,6 +1009,16 @@ def main() -> None:
     device = bundle["device"]
     mean = bundle["mean"]
     std = bundle["std"]
+
+    preprocessing_consistency, consistency_warnings = check_preprocessing_consistency(
+        args.preprocessed_dir,
+        preprocessing_mode=args.preprocessing_mode,
+        arrays_already_standardized=bool(args.arrays_already_standardized),
+        model_image_size=bundle["config"].get("image_size"),
+        optics_sha256=(optics_record or {}).get("optics_sha256"),
+        strict=args.strict,
+    )
+    manifest_warnings = manifest_warnings + consistency_warnings
 
     dataset = ExternalNPYDataset(
         manifest_rows=manifest_rows,
@@ -930,6 +1043,7 @@ def main() -> None:
             std=std,
             arrays_already_standardized=args.arrays_already_standardized,
             max_images=max_images_for_summary,
+            seed=args.seed,
         )
 
     image_rows = run_inference(
@@ -1006,6 +1120,9 @@ def main() -> None:
         elapsed_seconds=elapsed,
         manifest_warnings=manifest_warnings,
         input_distribution_summary=input_distribution_summary,
+        preprocessing_consistency=preprocessing_consistency,
+        optics_record=optics_record,
+        cohort_count_source=count_source,
     )
     write_json(metadata, metadata_json)
 

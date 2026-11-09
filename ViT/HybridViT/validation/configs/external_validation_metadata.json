@@ -1,6 +1,6 @@
 {
-  "schema_version": "1.0",
-  "purpose": "Metadata for the frozen LSA-ConvTok Hybrid model. This file stores slide-level species annotations, C. albicans morphology subgroups, expected slide counts, acquisition-protocol metadata, training-domain reference metadata, and validation rules. It should be used by external_manifest.py to assign labels and metadata without hard-coding biological or acquisition annotations inside evaluation scripts.",
+  "schema_version": "2.0",
+  "purpose": "Metadata for external validation of the frozen LSA-ConvTok Hybrid model. Stores slide-level species annotations, C. albicans morphology subgroups, expected slide counts, descriptive acquisition-protocol metadata, the optical acquisition primitives (optics), and validation rules. external_manifest.py uses it to assign labels; optics_provenance.py derives all optical geometry from the optics block.",
   "dataset_role": "external_validation",
   "domain": "external_new_microscope",
   "label_mapping": {
@@ -76,6 +76,44 @@
     "Candida albicans with hyphae": 5,
     "Candida albicans without hyphae": 7
   },
+  "optics": {
+    "schema_version": "2.0",
+    "external": {
+      "camera": "ZEISS Axiocam 820 mono",
+      "sensor_pixel_pitch_um": 2.74,
+      "sensor_native_px": [4512, 4512],
+      "binning_factor": 2,
+      "binning_mode": "unknown",
+      "objective_magnification": 63.0,
+      "objective_na": 1.4,
+      "camera_adapter_magnification": 1.0,
+      "stored_image_px": [2256, 2256],
+      "header_pixel_spacing_um": 0.08698412974552792,
+      "header_source": "imagej_unit_XResolution (verified across 24 external slides, shape 2256x2256, isotropic)"
+    },
+    "training": {
+      "camera": "Teledyne Photometrics Prime 95B",
+      "sensor_pixel_pitch_um": 11.0,
+      "sensor_native_px": [1200, 1200],
+      "binning_factor": 1,
+      "binning_mode": "none",
+      "objective_magnification": 63.0,
+      "objective_na": 1.4,
+      "camera_adapter_magnification": 1.0,
+      "stored_image_px": [1200, 1200],
+      "header_pixel_spacing_um": 0.1746031967750091,
+      "header_source": "imagej_unit_XResolution (verified across 60 internal slides, shape 1200x1200, isotropic)"
+    },
+    "network_input_px": 384,
+    "tolerances": {
+      "spacing_rel": 0.005
+    },
+    "notes": [
+      "Only physical primitives are stored. Pixel spacing, field of view, network-input spacing, decimation factors and cross-domain ratios are derived at runtime by optics_provenance.py and checked against header_pixel_spacing_um (rule O-3) and per-image TIFF calibration (rule O-4).",
+      "External 2x2 reduction (4512 -> 2256 px) is confirmed; whether it was hardware binning or digital subsampling/averaging is not encoded in the TIFF header (binning_mode = unknown, logged as a provenance gap under rule O-6).",
+      "Header values were verified by the author from imagej_unit_XResolution tags (geometry_spec.json audit of 60 internal and 24 external TIFFs). Theoretical values: external 137/1575 um/px, training 11/63 um/px."
+    ]
+  },
   "external_acquisition_metadata": {
     "microscope": "Zeiss Axio Observer.Z1",
     "objective": "Plan-Apochromat 63x/1.4 Oil",
@@ -84,25 +122,13 @@
     "software": "ZEN Blue",
     "exposure_time_ms": 50,
     "bit_depth": 14,
-    "pixel_spacing_um": {
-      "x": 0.043,
-      "y": 0.043
-    },
     "sample_preparation": "Agar pad technique with 1.7% agarose and 5 µL culture.",
     "sampling_strategy": "Images acquired from random areas of each slide; approximately 62 images per slide; focus manually optimized per slide and then kept constant.",
     "calibration": "No calibration performed."
   },
   "training_domain_reference": {
     "bit_depth": 12,
-    "pixel_spacing_um": {
-      "x": 0.175,
-      "y": 0.175
-    },
-    "purpose": "Stored only to document the acquisition-domain shift relative to the training domain. It must not be used to normalize external raw TIFF values."
-  },
-  "domain_shift_metadata": {
-    "external_to_training_pixel_spacing_ratio": 4.069767,
-    "interpretation": "The external images have approximately 4.07 times smaller pixel spacing per linear dimension than the original training-domain images; this should be treated as a geometric scale shift in addition to camera, illumination, exposure, and bit-depth shifts."
+    "purpose": "Stored only to document the acquisition-domain shift relative to the training domain. It must not be used to normalize external raw TIFF values. Optical geometry lives in the optics block."
   },
   "validation_rules": {
     "all_listed_slides_must_exist_in_manifest": true,
@@ -110,13 +136,30 @@
     "albicans_hyphae_and_no_hyphae_sets_must_be_disjoint": true,
     "all_albicans_slides_must_have_hyphae_status": true,
     "glabrata_slides_must_have_hyphae_status": "not_applicable",
-    "external_dataset_must_not_be_split_for_training": true
+    "external_dataset_must_not_be_split_for_training": true,
+    "optics_must_pass_O1_O2_O3": true
   },
   "quality_control_notes": [
     "Use slide_id as the independent biological/acquisition unit for primary statistics.",
     "Use image-level metrics only as descriptive secondary analyses.",
     "Do not infer or modify hyphae status from model predictions.",
-    "Slide identifiers are preserved exactly as provided by the laboratory/user and should be matched literally against the raw filenames."
+    "Slide identifiers are preserved exactly as provided by the laboratory/user and should be matched literally against the raw filenames.",
+    "Acquisition date is confounded with species (all C. glabrata slides on 20260507; 10/12 C. albicans slides on 20260508). Report this as a limitation.",
+    "Slide 20200528_alb_A carries a 2020 date while the cohort was acquired in May 2026; verify against the TIFF DateTime tag and lab records (PARTIAL)."
+  ],
+  "amendments": [
+    {
+      "date": "2026-11-08",
+      "change": "Post hoc physical-scale resampling sensitivity analysis retired; stored pixel spacings and spacing ratios removed; optics block (schema 2.0) introduced.",
+      "reason": "The external pixel spacing previously recorded was the unbinned sensor value applied to 2x2-reduced images (off by a factor of about 2.02); the analysis therefore did not test what it claimed. True spacings are now derived from physical primitives and verified against header calibration.",
+      "post_hoc": true
+    },
+    {
+      "date": "2026-11-08",
+      "change": "Photometric mean/std sensitivity analysis recorded as post hoc.",
+      "reason": "It was added after the primary locked result was observed; it is diagnostic only.",
+      "post_hoc": true
+    }
   ],
   "metadata_role": "external_validation_slide_and_acquisition_metadata"
 }
