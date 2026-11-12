@@ -456,8 +456,8 @@ class RolloutReviewPanel:
         slide_id: str = "",
         selection_reason: str = "",
         selection_role: str = "",
-        mmd2_after_selection = None,
-        witness_score = None,
+        mmd2_after_selection=None,
+        witness_score=None,
         scale_mode: str = "within_group",
     ) -> str:
         raw_display = _raw_image_to_display(raw_img)
@@ -468,45 +468,27 @@ class RolloutReviewPanel:
         label_name = self.class_names[label] if label < len(self.class_names) else str(label)
         pred_name  = self.class_names[pred]  if pred  < len(self.class_names) else str(pred)
         correct    = "✓" if label == pred else "✗"
+        gini_val   = _spatial_gini(ro_vec)
+        ent_val    = _spatial_entropy(ro_vec)
+        slide_str  = f" | Slide: {slide_id}" if slide_id else ""
 
-        meta_lines = [
-            f"Sample:     {sample_idx}",
-            f"Slide:      {slide_id}" if slide_id else "Slide:      n/a",
-            f"Group:      {group}",
-            "",
-            f"True label: {label_name} ({label})",
-            f"Prediction: {pred_name} ({pred}) {correct}",
-            f"Confidence: {confidence:.4f}",
-            "",
-            "Explanation: attention rollout",
-            f"Scale mode:      {scale_mode}",
-            f"Selection:       {selection_reason or 'not recorded'}",
-            f"Role:            {selection_role or 'not recorded'}",
-            f"MMD² after sel.: {_format_optional_float(mmd2_after_selection)}",
-            f"Witness score:   {_format_optional_float(witness_score)}",
-            f"Rollout Gini:    {_spatial_gini(ro_vec):.4f}",
-            f"Rollout entropy: {_spatial_entropy(ro_vec):.4f}",
-            f"Rollout L1:      {float(np.sum(np.abs(ro_vec))):.4f}",
-            f"Rollout L2:      {float(np.linalg.norm(ro_vec)):.4f}",
-            "",
-            "Rubric categories:",
-        ]
-        for cat in self._RUBRIC_CATEGORIES:
-            meta_lines.append(f"  [ ] {cat}")
-
-        n_cols = 4
-        fig_w = n_cols * 3.4
+        n_cols = 3
+        fig_w = n_cols * 3.5
         fig_h = 3.8
         fig = plt.figure(figsize=(fig_w, fig_h), dpi=self.dpi)
-        gs = gridspec.GridSpec(1, n_cols, figure=fig,
-                               left=0.01, right=0.99, top=0.88, bottom=0.04,
-                               wspace=0.16)
+        gs = gridspec.GridSpec(
+            1, n_cols, figure=fig,
+            left=0.02, right=0.96, top=0.84, bottom=0.04,
+            wspace=0.18,
+        )
 
         _group_colors = {"TP": "#d4efdf", "TN": "#d6eaf8", "FP": "#fadbd8", "FN": "#fdebd0"}
         title_bg = _group_colors.get(group, "#f2f3f4")
         fig.suptitle(
-            f"[{group}] Sample {sample_idx} | True: {label_name}  Pred: {pred_name}  Conf: {confidence:.3f}",
-            fontsize=11, fontweight="bold", y=0.97,
+            f"[{group}] Sample {sample_idx}{slide_str} | "
+            f"True: {label_name}  Pred: {pred_name} {correct} (Conf: {confidence:.3f}) | "
+            f"Gini: {gini_val:.3f}  H: {ent_val:.2f}",
+            fontsize=9.5, fontweight="bold", y=0.96,
             bbox=dict(facecolor=title_bg, edgecolor="none", boxstyle="round,pad=0.3"),
         )
 
@@ -514,27 +496,22 @@ class RolloutReviewPanel:
         _plot_raw(ax0, raw_display, title="Model-input\n(display-norm.)")
 
         ax1 = fig.add_subplot(gs[0, 1])
-        _plot_overlay(ax1, raw_display, ro_overlay,
-                      cmap=self.rollout_cmap, alpha=self.overlay_alpha,
-                      vmax=ro_vmax, title="Rollout overlay")
+        _plot_overlay(
+            ax1, raw_display, ro_overlay,
+            cmap=self.rollout_cmap, alpha=self.overlay_alpha,
+            vmax=ro_vmax, title="Rollout overlay",
+        )
 
         ax2 = fig.add_subplot(gs[0, 2])
-        im2 = ax2.imshow(ro_grid, cmap=self.rollout_cmap, vmin=0, vmax=ro_vmax, interpolation="nearest")
-        ax2.set_title("Rollout heatmap", fontsize=9)
-        ax2.set_xticks([]); ax2.set_yticks([])
-        plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
-
-        ax3 = fig.add_subplot(gs[0, 3])
-        ax3.axis("off")
-        ax3.text(
-            0.04, 0.97,
-            "\n".join(meta_lines),
-            transform=ax3.transAxes,
-            fontsize=8,
-            verticalalignment="top",
-            fontfamily="monospace",
-            bbox=dict(boxstyle="round", facecolor="#f8f9fa", alpha=0.7, edgecolor="#cccccc"),
+        im2 = ax2.imshow(
+            ro_grid, cmap=self.rollout_cmap,
+            vmin=0.0, vmax=max(float(ro_vmax), 1e-6),
+            interpolation="nearest",
         )
+        ax2.set_title("Rollout heatmap", fontsize=9)
+        ax2.set_xticks([])
+        ax2.set_yticks([])
+        plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
 
         save_path = self.output_dir / save_name
         plt.savefig(save_path, dpi=self.dpi, bbox_inches="tight")
@@ -1218,19 +1195,20 @@ def _upsample_map(
     vec: np.ndarray, num_patches_side: int, H: int, W: int
 ) -> np.ndarray:
     """
-    Bilinearly upsample a (P,) patch map to (H, W) for overlay rendering.
-
-    Uses scipy zoom for bilinear interpolation.
+    Upsample a (P,) patch relevance vector to (H, W) via exact Kronecker product
+    block expansion (np.kron). Preserves raw relevance values without min-max
+    rescaling and maintains exact (H // num_patches_side) x (W // num_patches_side)
+    token-to-pixel alignment.
     """
-    from scipy.ndimage import zoom
-    grid    = vec.reshape(num_patches_side, num_patches_side).astype(np.float32)
-    scale_h = H / num_patches_side
-    scale_w = W / num_patches_side
-    upsampled = zoom(grid, (scale_h, scale_w), order=1)   # bilinear
-    # Normalise to [0, 1] for overlay
-    mn, mx = float(upsampled.min()), float(upsampled.max())
-    if mx - mn > 1e-8:
-        upsampled = (upsampled - mn) / (mx - mn)
+    grid = np.asarray(vec, dtype=np.float32).reshape(num_patches_side, num_patches_side)
+    if H % num_patches_side != 0 or W % num_patches_side != 0:
+        raise ValueError(
+            f"Image dimensions ({H}, {W}) must be divisible by "
+            f"num_patches_side ({num_patches_side}) for exact token alignment."
+        )
+    patch_h = H // num_patches_side
+    patch_w = W // num_patches_side
+    upsampled = np.kron(grid, np.ones((patch_h, patch_w), dtype=np.float32))
     return upsampled.astype(np.float32)
 
 
@@ -1253,15 +1231,22 @@ def _plot_overlay(
     vmax: float,
     title: str,
 ) -> None:
-    """Render raw image with semi-transparent saliency overlay."""
+    """Render raw image with semi-transparent token-aligned saliency overlay."""
     if raw_display.ndim == 2:
         ax.imshow(raw_display, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
     else:
         ax.imshow(np.clip(raw_display, 0, 1), interpolation="nearest")
-    ax.imshow(saliency, cmap=cmap, vmin=0, vmax=max(vmax, 1e-6),
-              alpha=alpha, interpolation="bilinear")
+    ax.imshow(
+        saliency,
+        cmap=cmap,
+        vmin=0.0,
+        vmax=max(float(vmax), 1e-6),
+        alpha=alpha,
+        interpolation="nearest",
+    )
     ax.set_title(title, fontsize=9)
-    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xticks([])
+    ax.set_yticks([])
 
 
 def _spatial_entropy(vec: np.ndarray, eps: float = 1e-12) -> float:
